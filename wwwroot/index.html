@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Teams Bot Transcription</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+    h1 { margin-bottom: 8px; }
+    .row { display: flex; gap: 8px; margin-bottom: 12px; }
+    input { flex: 1; padding: 10px; }
+    button { padding: 10px 14px; cursor: pointer; }
+    #status { margin: 10px 0; color: #1f4f8f; }
+    #roster { margin: 10px 0; padding: 10px; background: #f5f7fa; border-radius: 6px; font-size: 14px; }
+    #roster .tag { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 8px; background: #e8eef7; border-radius: 4px; }
+    #transcripts { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 260px; }
+    .line { margin: 6px 0; }
+    .partial { color: #666; }
+    .final { color: #111; font-weight: 600; }
+    .speaker { color: #0d47a1; font-weight: 600; margin-right: 6px; }
+    .aad-id { font-size: 11px; color: #555; font-weight: normal; }
+  </style>
+</head>
+<body>
+  <h1>Teams Bot Live Transcription</h1>
+  <p>Enter a Teams meeting join URL, then click Join Call.</p>
+
+  <div class="row">
+    <input id="meetingUrl" type="text" placeholder="https://teams.microsoft.com/l/meetup-join/..." />
+    <button id="joinBtn">Join Call</button>
+  </div>
+
+  <div id="status">Connecting to transcript stream...</div>
+  <div id="roster" hidden></div>
+  <div id="transcripts"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"></script>
+  <script>
+    const statusEl = document.getElementById("status");
+    const rosterEl = document.getElementById("roster");
+    const transcriptsEl = document.getElementById("transcripts");
+    const meetingUrlEl = document.getElementById("meetingUrl");
+    const joinBtn = document.getElementById("joinBtn");
+
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("/hubs/transcripts")
+      .withAutomaticReconnect()
+      .build();
+
+    let lastRosterByAad = {};
+
+    function pick(obj, camel, pascal) {
+      if (obj == null) return undefined;
+      if (camel in obj && obj[camel] != null && obj[camel] !== "") return obj[camel];
+      if (pascal && pascal in obj && obj[pascal] != null && obj[pascal] !== "") return obj[pascal];
+      return undefined;
+    }
+
+    connection.on("roster", (payload) => {
+      lastRosterByAad = {};
+      const list = payload.participants || payload.Participants || [];
+      if (list.length === 0) {
+        rosterEl.hidden = true;
+        rosterEl.textContent = "";
+        return;
+      }
+      for (const p of list) {
+        const oid = pick(p, "azureAdObjectId", "AzureAdObjectId");
+        if (oid) {
+          const dn = pick(p, "displayName", "DisplayName");
+          const upn = pick(p, "userPrincipalName", "UserPrincipalName");
+          const id = pick(p, "id", "Id");
+          lastRosterByAad[oid] = dn || upn || id || "";
+        }
+      }
+      rosterEl.hidden = false;
+      rosterEl.innerHTML = "<strong>In this meeting (Microsoft Entra)</strong> " +
+        list.map((p) => {
+          const name = pick(p, "displayName", "DisplayName") || pick(p, "id", "Id") || "";
+          const upnRaw = pick(p, "userPrincipalName", "UserPrincipalName");
+          const upn = upnRaw ? ` — ${upnRaw}` : "";
+          const oidRaw = pick(p, "azureAdObjectId", "AzureAdObjectId");
+          const oid = oidRaw ? ` [object ID: ${oidRaw}]` : "";
+          return `<span class="tag" title="${escapeHtml(String(upnRaw || "") + String(oidRaw || ""))}">${escapeHtml(name)}${escapeHtml(upn)}${escapeHtml(oid)}</span>`;
+        }).join("");
+    });
+
+    connection.on("transcript", (message) => {
+      if (message == null) return;
+      const kindRaw = pick(message, "kind", "Kind");
+      const kind = kindRaw != null ? String(kindRaw) : "";
+      if (kind.toLowerCase() !== "final") {
+        return;
+      }
+      const text = pick(message, "text", "Text");
+      if (text == null || String(text).trim() === "") {
+        return;
+      }
+      const line = document.createElement("div");
+      line.className = "line final";
+      let label = "";
+      const sl = pick(message, "speakerLabel", "SpeakerLabel");
+      if (sl != null && String(sl).trim() !== "" && String(sl).trim() !== "0") {
+        label = String(sl).trim();
+      }
+      const aad = pick(message, "azureAdObjectId", "AzureAdObjectId");
+      if (!label && aad && lastRosterByAad[aad]) {
+        label = lastRosterByAad[aad];
+      }
+      const who = label
+        ? `<span class="speaker">${escapeHtml(label)}</span>`
+        : "";
+      const oid = aad
+        ? ` <span class="aad-id" title="Microsoft Entra object ID">${escapeHtml(String(aad))}</span>`
+        : "";
+      line.innerHTML = `${who}<span class="text">${escapeHtml(String(text))}</span>${oid}`;
+      transcriptsEl.prepend(line);
+    });
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    async function startHub() {
+      try {
+        await connection.start();
+        statusEl.textContent = "Connected. Ready to join meeting.";
+      } catch (err) {
+        statusEl.textContent = "SignalR connection failed. Retrying...";
+        setTimeout(startHub, 2000);
+      }
+    }
+
+    joinBtn.addEventListener("click", async () => {
+      const meetingJoinUrl = meetingUrlEl.value.trim();
+      if (!meetingJoinUrl) {
+        statusEl.textContent = "Please enter a meeting join URL.";
+        return;
+      }
+
+      statusEl.textContent = "Submitting join request...";
+      try {
+        const response = await fetch("/api/bot/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ meetingJoinUrl })
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          statusEl.textContent = `Join failed: ${error}`;
+          return;
+        }
+
+        statusEl.textContent = "Join request submitted. Waiting for live transcripts...";
+      } catch (err) {
+        statusEl.textContent = "Join request failed.";
+      }
+    });
+
+    startHub();
+  </script>
+</body>
+</html>
