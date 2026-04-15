@@ -101,13 +101,14 @@ public sealed class ParticipantAudioRouter
         {
             BufferUnmappedAudio(ssrc, rawPayload, timestampHns);
             if (!_unmappedSsrcLogThrottle.TryGetValue(ssrc, out var last) ||
-                (DateTime.UtcNow - last) >= TimeSpan.FromSeconds(10))
+                (DateTime.UtcNow - last) >= TimeSpan.FromSeconds(30))
             {
                 _unmappedSsrcLogThrottle[ssrc] = DateTime.UtcNow;
                 _logger.LogWarning(
                     "Buffering audio: SSRC/sourceId {Ssrc} is not mapped yet (buffer timeout {TimeoutSeconds}s).",
                     ssrc,
                     BufferTimeout.TotalSeconds);
+                Console.WriteLine($"[CONSOLE][ROUTER][BUFFERING] sourceId={ssrc}, timeoutSec={BufferTimeout.TotalSeconds}, bytes={rawPayload.Length}");
             }
             return;
         }
@@ -140,6 +141,7 @@ public sealed class ParticipantAudioRouter
                 "ROUTER[FLUSH] Replaying {Count} buffered frames for SSRC/sourceId {Ssrc}.",
                 framesToReplay.Count,
                 ssrc);
+            Console.WriteLine($"[CONSOLE][ROUTER][FLUSH] sourceId={ssrc}, replayFrames={framesToReplay.Count}");
             foreach (var buffered in framesToReplay)
             {
                 await ProcessWithIdentity(ssrc, participant, buffered.Payload, buffered.TimestampHns);
@@ -282,6 +284,7 @@ public sealed class ParticipantAudioRouter
 
             _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
             _logger.LogInformation("[SSRC BIND] sourceId {SourceId} -> {DisplayName} ({ParticipantId})", sourceId, dn, pid);
+            Console.WriteLine($"[CONSOLE][ROUTER][BIND] sourceId={sourceId}, participant={pid}, displayName={dn}");
             _unmappedSsrcLogThrottle.TryRemove(sourceId, out _);
             _ = FlushBufferedAsync(sourceId);
         }

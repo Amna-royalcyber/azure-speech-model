@@ -302,9 +302,11 @@ public sealed class MeetingParticipantService
             "MAP[INGEST] Parsed {SourceCount} sourceIds for participant {ParticipantId}.",
             sourceIds.Count,
             azureUserId);
+        Console.WriteLine($"[CONSOLE][MAP][INGEST] participant={azureUserId}, intra={callPartId}, parsedSourceIds={sourceIds.Count}");
         foreach (var sid in sourceIds)
         {
             BindMediaStreamToParticipant(sid, azureUserId, callPartId);
+            Console.WriteLine($"[CONSOLE][MAP][BIND] sourceId={sid} -> participant={azureUserId}, intra={callPartId}");
             _logger.LogInformation(
                 "Authoritative stream map: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}); intra={IntraId}.",
                 sid,
@@ -327,9 +329,19 @@ public sealed class MeetingParticipantService
             }
             _noSourceLogThrottle[throttleKey] = DateTime.UtcNow;
 
+            var keys = resource.AdditionalData is null
+                ? "<none>"
+                : string.Join(", ", resource.AdditionalData.Keys);
+            var anonymized = ReadAdditionalDataBool(resource.AdditionalData, "isIdentityAnonymized");
+            var voiceConsent = ReadAdditionalDataString(resource.AdditionalData, "aiVoiceConsent");
             _logger.LogWarning(
-                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; unmixed audio for this user is buffered briefly until Graph publishes stream ids.",
-                azureUserId);
+                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; audio is buffered briefly until Graph publishes stream ids. AdditionalData keys={Keys}, isIdentityAnonymized={IsIdentityAnonymized}, aiVoiceConsent={AiVoiceConsent}.",
+                azureUserId,
+                keys,
+                anonymized.HasValue ? anonymized.Value.ToString() : "<missing>",
+                string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent);
+            Console.WriteLine(
+                $"[CONSOLE][MAP][MISSING] participant={azureUserId}, additionalDataKeys={keys}, isIdentityAnonymized={(anonymized.HasValue ? anonymized.Value.ToString() : "<missing>")}, aiVoiceConsent={(string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent)}");
         }
 
         _ = PublishRosterAsync();

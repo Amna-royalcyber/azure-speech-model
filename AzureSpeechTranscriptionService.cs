@@ -92,6 +92,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                     ssrc,
                     participant.DisplayName,
                     participant.ParticipantId);
+                Console.WriteLine($"[CONSOLE][SPEECH][START] creating recognizer sourceId={ssrc}, participant={participant.ParticipantId}, name={participant.DisplayName}");
                 await StartRecognizerAsync(session, ssrc, participant).ConfigureAwait(false);
             }
 
@@ -143,6 +144,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 }
 
                 _logger.LogInformation("TRANSCRIPT [{DisplayName}]: {Text}", participant.DisplayName, text);
+                Console.WriteLine($"[CONSOLE][SPEECH][TRANSCRIPT] sourceId={ssrc}, speaker={participant.DisplayName}, text={text}");
                 var conf = TryParseConfidence(e.Result);
                 _ = EmitTranscriptAsync(ssrc, participant, text, conf);
             };

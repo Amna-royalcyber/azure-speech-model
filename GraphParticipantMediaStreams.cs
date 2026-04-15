@@ -94,6 +94,7 @@ internal static class GraphParticipantMediaStreams
         var list = new List<uint>();
         if (participant?.AdditionalData is null)
         {
+            Console.WriteLine("[CONSOLE][MAP][EXTRACT] participant additionalData is null; no sourceIds.");
             return list;
         }
 
@@ -109,6 +110,7 @@ internal static class GraphParticipantMediaStreams
 
         if (msObj is null)
         {
+            Console.WriteLine("[CONSOLE][MAP][EXTRACT] mediaStreams key missing in additionalData.");
             return list;
         }
 
@@ -123,6 +125,7 @@ internal static class GraphParticipantMediaStreams
             AddSourceIdsFromJsonElement(je, list);
             if (list.Count > 0)
             {
+                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds from JsonElement direct: [{string.Join(",", list)}]");
                 return list.Distinct().ToList();
             }
 
@@ -138,16 +141,27 @@ internal static class GraphParticipantMediaStreams
 
             if (list.Count > 0)
             {
+                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds after JsonElement raw parse: [{string.Join(",", list)}]");
                 return list.Distinct().ToList();
             }
 
             // Ultimate fallback: recursively search all AdditionalData for keys named sourceId.
             ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
+            if (list.Count == 0)
+            {
+                var keys = string.Join(", ", participant.AdditionalData.Keys);
+                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] recursive scan found 0 sourceIds. additionalData keys={keys}");
+            }
+            else
+            {
+                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds after recursive scan: [{string.Join(",", list)}]");
+            }
             return list.Distinct().ToList();
         }
 
         if (msObj is string str && TryParseFromJson(str, list))
         {
+            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds from string mediaStreams: [{string.Join(",", list)}]");
             return list;
         }
 
@@ -166,6 +180,15 @@ internal static class GraphParticipantMediaStreams
             ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
         }
 
+        if (list.Count == 0)
+        {
+            var keys = string.Join(", ", participant.AdditionalData.Keys);
+            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] final result: 0 sourceIds. additionalData keys={keys}");
+        }
+        else
+        {
+            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] final sourceIds: [{string.Join(",", list)}]");
+        }
         return list.Distinct().ToList();
     }
 
