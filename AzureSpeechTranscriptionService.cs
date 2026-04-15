@@ -103,6 +103,41 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Fallback path when Graph never provides mediaStreams/sourceId attribution for a live SSRC.
+    /// Transcription continues with an explicit unattributed identity.
+    /// </summary>
+    public async Task ProcessAudioFallbackAsync(uint ssrc, byte[] pcm16kMono, long timestampHns)
+    {
+        var fallbackParticipant = new TranscriptionParticipant(
+            ParticipantId: $"unmapped:{ssrc}",
+            DisplayName: $"Unattributed-{ssrc}",
+            IntraId: $"unmapped:{ssrc}");
+        await ProcessAudioAsync(ssrc, fallbackParticipant, pcm16kMono, timestampHns).ConfigureAwait(false);
+    }
+
+    /// <summary>Late-binding identity reconciliation for an already active SSRC recognizer session.</summary>
+    public async Task UpdateIdentityAsync(uint ssrc, TranscriptionParticipant identity)
+    {
+        if (!_sessions.TryGetValue(ssrc, out var session))
+        {
+            return;
+        }
+
+        await session.Serialize.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (session.Gate)
+            {
+                session.Participant = identity;
+            }
+        }
+        finally
+        {
+            session.Serialize.Release();
+        }
+    }
+
     private async Task StartRecognizerAsync(StreamSession session, uint ssrc, TranscriptionParticipant participant)
     {
         lock (session.Gate)
@@ -135,9 +170,15 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                     return;
                 }
 
-                _logger.LogInformation("TRANSCRIPT [{DisplayName}]: {Text}", participant.DisplayName, text);
+                TranscriptionParticipant currentIdentity;
+                lock (session.Gate)
+                {
+                    currentIdentity = session.Participant ?? participant;
+                }
+
+                _logger.LogInformation("TRANSCRIPT [{DisplayName}]: {Text}", currentIdentity.DisplayName, text);
                 var conf = TryParseConfidence(e.Result);
-                _ = EmitTranscriptAsync(ssrc, participant, text, conf);
+                _ = EmitTranscriptAsync(ssrc, currentIdentity, text, conf);
             };
 
             recognizer.Canceled += (_, e) =>

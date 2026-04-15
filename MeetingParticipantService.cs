@@ -14,6 +14,7 @@ namespace TeamsMediaBot;
 public sealed class MeetingParticipantService
 {
     private readonly TranscriptBroadcaster _broadcaster;
+    private readonly IChunkManager _chunkManager;
     private readonly EntraUserResolver _entra;
     private readonly IParticipantManager _participantManager;
     private readonly SsrcParticipantMapper _ssrcMapper;
@@ -21,6 +22,7 @@ public sealed class MeetingParticipantService
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<string, DateTime> _noSourceLogThrottle = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _payloadLogThrottle = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _consentBlockedLogThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Call participant resource ids (for removals).</summary>
     private readonly Dictionary<string, string> _callParticipantIdToAzureUserId = new(StringComparer.OrdinalIgnoreCase);
@@ -33,15 +35,20 @@ public sealed class MeetingParticipantService
 
     /// <summary>Teams media <c>sourceId</c> → Graph call participant resource id (intra meeting id).</summary>
     private readonly ConcurrentDictionary<uint, string> _sourceIdToCallParticipantId = new();
+    public event Action<uint, string>? SourceIdReconciled;
+    private Func<uint, TranscriptionParticipant, Task>? _audioReconciler;
+    private ParticipantAudioRouter? _participantAudioRouter;
 
     public MeetingParticipantService(
         TranscriptBroadcaster broadcaster,
+        IChunkManager chunkManager,
         EntraUserResolver entra,
         IParticipantManager participantManager,
         SsrcParticipantMapper ssrcMapper,
         ILogger<MeetingParticipantService> logger)
     {
         _broadcaster = broadcaster;
+        _chunkManager = chunkManager;
         _entra = entra;
         _participantManager = participantManager;
         _ssrcMapper = ssrcMapper;
@@ -119,6 +126,56 @@ public sealed class MeetingParticipantService
         _sourceIdToCallParticipantId[sourceId] = intra;
         _ssrcMapper.Bind(sourceId, e);
         _logger.LogDebug("MAP[BIND] sourceId/SSRC {SourceId} -> participant {ParticipantId}, intra={IntraId}.", sourceId, e, intra);
+        _ = _participantAudioRouter?.ReconcileSsrcAsync(sourceId);
+    }
+
+    /// <summary>
+    /// Called when roster finally provides sourceId for an already ingested participant.
+    /// Triggers downstream audio buffer flush + retroactive transcript identity update.
+    /// </summary>
+    public async Task ReconcilePendingAudio(uint sourceId, string participantId)
+    {
+        var intraId = _sourceIdToCallParticipantId.TryGetValue(sourceId, out var mappedIntraId) &&
+                      !string.IsNullOrWhiteSpace(mappedIntraId)
+            ? mappedIntraId
+            : participantId;
+
+        if (TryResolveAudioSourceToEntra(sourceId, out _, out var displayName) && !string.IsNullOrWhiteSpace(displayName))
+        {
+            var updated = await _chunkManager
+                .ReconcileRecentIdentityAsync(sourceId, participantId, displayName, TimeSpan.FromSeconds(10))
+                .ConfigureAwait(false);
+            await _broadcaster.BroadcastTranscriptIdentityUpdateAsync(sourceId, displayName, participantId).ConfigureAwait(false);
+            await _broadcaster.BroadcastIdentityResolved(sourceId, displayName, participantId).ConfigureAwait(false);
+            if (updated > 0)
+            {
+                await _broadcaster.BroadcastTranscriptRetroactiveUpdateAsync(sourceId, displayName, participantId, updated).ConfigureAwait(false);
+            }
+
+            if (_audioReconciler is not null)
+            {
+                await _audioReconciler(
+                    sourceId,
+                    new TranscriptionParticipant(participantId, displayName, intraId)).ConfigureAwait(false);
+            }
+        }
+        else
+        {
+            await _broadcaster.BroadcastTranscriptIdentityUpdateAsync(sourceId, participantId, participantId).ConfigureAwait(false);
+            await _broadcaster.BroadcastIdentityResolved(sourceId, participantId, participantId).ConfigureAwait(false);
+        }
+
+        SourceIdReconciled?.Invoke(sourceId, participantId);
+    }
+
+    public void RegisterAudioRouterReconciler(Func<uint, TranscriptionParticipant, Task> reconciler)
+    {
+        _audioReconciler = reconciler;
+    }
+
+    public void RegisterParticipantAudioRouter(ParticipantAudioRouter participantAudioRouter)
+    {
+        _participantAudioRouter = participantAudioRouter;
     }
 
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
@@ -297,13 +354,17 @@ public sealed class MeetingParticipantService
 
         AddOrUpdateParticipant(azureUserId, displayName ?? azureUserId, callPartId);
 
-        var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
+        var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource, _logger).ToList();
         _logger.LogDebug(
             "MAP[INGEST] Parsed {SourceCount} sourceIds for participant {ParticipantId}.",
             sourceIds.Count,
             azureUserId);
         foreach (var sid in sourceIds)
         {
+            var isNewSourceForParticipant =
+                !_audioSourceIdToAzureObjectId.TryGetValue(sid, out var existingParticipantId) ||
+                !string.Equals(existingParticipantId, azureUserId, StringComparison.OrdinalIgnoreCase);
+
             BindMediaStreamToParticipant(sid, azureUserId, callPartId);
             _logger.LogInformation(
                 "Authoritative stream map: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}); intra={IntraId}.",
@@ -311,6 +372,15 @@ public sealed class MeetingParticipantService
                 displayName ?? azureUserId,
                 azureUserId,
                 callPartId);
+
+            if (isNewSourceForParticipant)
+            {
+                _logger.LogInformation(
+                    "MAP[RECONCILE] New sourceId {SourceId} resolved for participant {ParticipantId}. Triggering pending audio reconciliation.",
+                    sid,
+                    azureUserId);
+                _ = ReconcilePendingAudio(sid, azureUserId);
+            }
         }
 
         if (sourceIds.Count == 0)
@@ -348,6 +418,7 @@ public sealed class MeetingParticipantService
                 : string.Join(", ", resource.AdditionalData.Keys);
             var anonymized = ReadAdditionalDataBool(resource.AdditionalData, "isIdentityAnonymized");
             var voiceConsent = ReadAdditionalDataString(resource.AdditionalData, "aiVoiceConsent");
+            var aiVoiceConsentValue = ReadAiVoiceConsentValue(resource.AdditionalData);
             var rosterRole = ReadAdditionalDataString(resource.AdditionalData, "role");
             var endpointType = ReadAdditionalDataString(resource.AdditionalData, "endpointType");
             _logger.LogWarning(
@@ -360,6 +431,18 @@ public sealed class MeetingParticipantService
                 string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent,
                 string.IsNullOrWhiteSpace(rosterRole) ? "<missing>" : rosterRole,
                 string.IsNullOrWhiteSpace(endpointType) ? "<missing>" : endpointType);
+
+            if (aiVoiceConsentValue == "0")
+            {
+                if (!_consentBlockedLogThrottle.TryGetValue(azureUserId, out var consentBlockedAt) ||
+                    (DateTime.UtcNow - consentBlockedAt) >= TimeSpan.FromSeconds(30))
+                {
+                    _consentBlockedLogThrottle[azureUserId] = DateTime.UtcNow;
+                    _logger.LogError(
+                        "GRAPH[STREAM][BLOCKED_BY_CONSENT] aiVoiceConsentValue=0 for participant {AzureAdObjectId}. Graph will not publish mediaStreams/sourceId; SSRC cannot be identity-mapped. Fix tenant/meeting voice consent and rejoin call.",
+                        azureUserId);
+                }
+            }
         }
 
         _ = PublishRosterAsync();
@@ -588,6 +671,51 @@ public sealed class MeetingParticipantService
         }
 
         return null;
+    }
+
+    private static string? ReadAiVoiceConsentValue(IDictionary<string, object>? additionalData)
+    {
+        var raw = ReadAdditionalDataString(additionalData, "aiVoiceConsent");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            if (!root.TryGetProperty("value", out var valueNode) || valueNode.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            if (!valueNode.TryGetProperty("aiVoiceConsentValue", out var consentNode))
+            {
+                return null;
+            }
+
+            if (consentNode.ValueKind == JsonValueKind.String)
+            {
+                return consentNode.GetString();
+            }
+
+            if (consentNode.ValueKind == JsonValueKind.Number)
+            {
+                return consentNode.GetRawText();
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private readonly record struct RosterEntry(

@@ -27,4 +27,11 @@ public interface IChunkManager
         string dedupeKey,
         uint? sourceStreamId = null,
         CancellationToken cancellationToken = default);
+
+    Task<int> ReconcileRecentIdentityAsync(
+        uint sourceId,
+        string participantId,
+        string displayName,
+        TimeSpan lookback,
+        CancellationToken cancellationToken = default);
 }

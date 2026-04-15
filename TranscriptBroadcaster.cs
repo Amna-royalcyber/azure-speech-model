@@ -83,6 +83,47 @@ public sealed class TranscriptBroadcaster
         }
     }
 
+    public async Task BroadcastIdentityResolved(uint sourceId, string displayName, string entraOid)
+    {
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("identity-resolved", new
+            {
+                sourceId,
+                displayName,
+                entraOid,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR identity-resolved broadcast failed for sourceId={SourceId}.", sourceId);
+        }
+    }
+
+    /// <summary>
+    /// UI hint that recent already-processed transcript rows for this sourceId should be renamed.
+    /// </summary>
+    public async Task BroadcastTranscriptRetroactiveUpdateAsync(uint sourceId, string displayName, string participantId, int updatedCount)
+    {
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("transcript-retroactive-update", new
+            {
+                type = "transcript-retroactive-update",
+                sourceId,
+                displayName,
+                participantId,
+                updatedCount,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR transcript-retroactive-update failed for sourceId={SourceId}.", sourceId);
+        }
+    }
+
     public async Task BroadcastRosterAsync(IReadOnlyList<RosterParticipantDto> participants)
     {
         try

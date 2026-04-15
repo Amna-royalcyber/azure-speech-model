@@ -15,7 +15,7 @@ internal static class UnmixedAudioHelpers
         var none = (uint)DominantSpeakerChangedEventArgs.None;
         try
         {
-            foreach (var propName in new[] { "SourceId", "StreamSourceId", "MediaSourceId" })
+            foreach (var propName in new[] { "SourceId", "StreamSourceId", "MediaSourceId", "Ssrc", "SSRC", "Source" })
             {
                 var p = ub.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
                 if (p is null)
@@ -34,6 +34,21 @@ internal static class UnmixedAudioHelpers
                         return true;
                 }
             }
+
+            foreach (var fieldName in new[] { "_sourceId", "sourceId", "_streamSourceId", "streamSourceId" })
+            {
+                var f = ub.GetType().GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (f is null)
+                {
+                    continue;
+                }
+
+                var val = f.GetValue(ub);
+                if (TryConvertToSsrc(val, none, out ssrc))
+                {
+                    return true;
+                }
+            }
         }
         catch
         {
@@ -48,6 +63,31 @@ internal static class UnmixedAudioHelpers
         }
 
         return false;
+    }
+
+    private static bool TryConvertToSsrc(object? val, uint none, out uint ssrc)
+    {
+        ssrc = 0;
+        switch (val)
+        {
+            case uint u when u != 0 && u != none:
+                ssrc = u;
+                return true;
+            case int i when i > 0 && i != (int)none:
+                ssrc = (uint)i;
+                return true;
+            case long l when l > 0 && l <= uint.MaxValue && l != none:
+                ssrc = (uint)l;
+                return true;
+            default:
+                if (val is not null && uint.TryParse(val.ToString(), out var parsed) && parsed != 0 && parsed != none)
+                {
+                    ssrc = parsed;
+                    return true;
+                }
+
+                return false;
+        }
     }
 
     public static byte[] CopyPayload(IntPtr ptr, long length)

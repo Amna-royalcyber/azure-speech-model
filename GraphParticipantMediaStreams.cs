@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Models;
 
 namespace TeamsMediaBot;
@@ -90,7 +91,7 @@ public sealed class SsrcParticipantMapper
 /// <summary>Parses Teams/Graph <c>participant.resource.additionalData["mediaStreams"]</c> source ids (shared by router + roster).</summary>
 internal static class GraphParticipantMediaStreams
 {
-    public static List<uint> ExtractSourceIds(Participant? participant)
+    public static IEnumerable<uint> ExtractSourceIds(Participant? participant, ILogger? logger = null)
     {
         var list = new List<uint>();
         if (participant is null)
@@ -98,31 +99,42 @@ internal static class GraphParticipantMediaStreams
             return list;
         }
 
-        // 1) SDK-typed or reflected MediaStreams first (works when AdditionalData does not carry mediaStreams).
+        // 1) Try strongly-typed/reflected media stream property first.
         TryAddSourceIdsFromTypedOrReflectedMediaStreams(participant, list);
-        if (list.Count > 0)
+        var hasTypedMediaStreams = list.Count > 0;
+
+        object? rawMediaStreams = null;
+        if (participant.AdditionalData is not null)
+        {
+            foreach (var kvp in participant.AdditionalData)
+            {
+                if (string.Equals(kvp.Key, "mediaStreams", StringComparison.OrdinalIgnoreCase))
+                {
+                    rawMediaStreams = kvp.Value;
+                    break;
+                }
+            }
+        }
+
+        var rawMediaStreamsText = SafeToShortString(rawMediaStreams, 1200);
+        var dataKeys = participant.AdditionalData is null ? "" : string.Join(",", participant.AdditionalData.Keys);
+        logger?.LogWarning(
+            "MEDIASTREAM DEBUG: participantId={Pid}, hasMediaStreams={Has}, additionalDataKeys={Keys}, raw={Raw}",
+            participant.Info?.Identity?.User?.Id,
+            hasTypedMediaStreams,
+            dataKeys,
+            rawMediaStreamsText);
+
+        if (participant.AdditionalData is null)
         {
             return list.Distinct().ToList();
         }
 
-        if (participant.AdditionalData is null)
-        {
-            return list;
-        }
-
-        object? msObj = null;
-        foreach (var kvp in participant.AdditionalData)
-        {
-            if (string.Equals(kvp.Key, "mediaStreams", StringComparison.OrdinalIgnoreCase))
-            {
-                msObj = kvp.Value;
-                break;
-            }
-        }
+        var msObj = rawMediaStreams;
 
         if (msObj is null)
         {
-            return list;
+            return list.Distinct().ToList();
         }
 
         msObj = msObj switch
@@ -182,6 +194,35 @@ internal static class GraphParticipantMediaStreams
         return list.Distinct().ToList();
     }
 
+    private static string SafeToShortString(object? value, int maxChars)
+    {
+        if (value is null)
+        {
+            return "<missing>";
+        }
+
+        string text;
+        if (value is JsonElement je)
+        {
+            text = je.GetRawText();
+        }
+        else if (value is JsonDocument jd)
+        {
+            text = jd.RootElement.GetRawText();
+        }
+        else
+        {
+            text = value.ToString() ?? "<missing>";
+        }
+
+        if (text.Length <= maxChars)
+        {
+            return text;
+        }
+
+        return text[..maxChars] + "...<truncated>";
+    }
+
     public static string BuildParticipantDiagnostics(Participant? participant, int maxChars = 2500)
     {
         if (participant is null)
@@ -222,6 +263,28 @@ internal static class GraphParticipantMediaStreams
             return;
         }
 
+        if (mediaStreams is System.Collections.IEnumerable enumerable)
+        {
+            foreach (var stream in enumerable)
+            {
+                if (stream is null)
+                {
+                    continue;
+                }
+
+                var sourceIdObj = GetPropertyValueCaseInsensitive(stream, "SourceId");
+                if (sourceIdObj is null)
+                {
+                    continue;
+                }
+
+                if (TryConvertToUInt32(sourceIdObj, out var sid))
+                {
+                    list.Add(sid);
+                }
+            }
+        }
+
         ScanUnknownForSourceIds(mediaStreams, list);
     }
 
@@ -231,6 +294,28 @@ internal static class GraphParticipantMediaStreams
             propertyName,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
         return prop?.GetValue(instance);
+    }
+
+    private static bool TryConvertToUInt32(object value, out uint sid)
+    {
+        sid = 0;
+        switch (value)
+        {
+            case uint u:
+                sid = u;
+                return true;
+            case int i when i > 0:
+                sid = (uint)i;
+                return true;
+            case long l when l > 0 && l <= uint.MaxValue:
+                sid = (uint)l;
+                return true;
+            case short s when s > 0:
+                sid = (uint)s;
+                return true;
+            default:
+                return uint.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out sid);
+        }
     }
 
     private static void AddSourceIdsFromJsonElement(JsonElement je, List<uint> list)

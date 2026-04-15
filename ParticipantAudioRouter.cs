@@ -23,10 +23,12 @@ public sealed class ParticipantAudioRouter
 
     private ICall? _attachedCall;
     private string _botClientId = string.Empty;
+    private readonly object _rescanLock = new();
+    private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
     private readonly ConcurrentDictionary<uint, DateTime> _unmappedSsrcLogThrottle = new();
     private readonly ConcurrentDictionary<uint, Queue<BufferedFrame>> _audioBuffer = new();
     private readonly ConcurrentDictionary<uint, DateTime> _unmappedSsrcFirstSeen = new();
-    private static readonly TimeSpan BufferTimeout = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan BufferTimeout = TimeSpan.FromSeconds(15);
     private const int MaxBufferedFramesPerSsrc = 120;
 
     public ParticipantAudioRouter(
@@ -43,6 +45,8 @@ public sealed class ParticipantAudioRouter
         _ssrcMapper = ssrcMapper;
         _participantManager = participantManager;
         _logger = logger;
+        _meetingParticipants.RegisterParticipantAudioRouter(this);
+        _meetingParticipants.RegisterAudioRouterReconciler(FlushOrphanedAudio);
     }
 
     public void AttachToCall(ICall call, string botClientId)
@@ -92,10 +96,12 @@ public sealed class ParticipantAudioRouter
     /// </summary>
     public async Task HandleAudioAsync(uint ssrc, byte[] rawPayload, long timestampHns)
     {
-        if (!_ssrcMapper.HasMapping(ssrc))
+        MaybeRescanParticipantMediaStreams();
+
+        if (!_ssrcMapper.HasMapping(ssrc) && !_participantManager.HasBinding(ssrc))
         {
             var firstSeen = _unmappedSsrcFirstSeen.GetOrAdd(ssrc, _ => DateTime.UtcNow);
-            BufferUnmappedAudio(ssrc, rawPayload, timestampHns);
+            BufferOrphanedAudio(ssrc, rawPayload, timestampHns);
             if (!_unmappedSsrcLogThrottle.TryGetValue(ssrc, out var last) ||
                 (DateTime.UtcNow - last) >= TimeSpan.FromSeconds(30))
             {
@@ -108,7 +114,7 @@ public sealed class ParticipantAudioRouter
                 var orphanFor = DateTime.UtcNow - firstSeen;
                 if (orphanFor >= TimeSpan.FromSeconds(10))
                 {
-                    _logger.LogWarning(
+                    _logger.LogError(
                         "ROUTER[ORPHAN] sourceId/SSRC {Ssrc} has been unmapped for {Seconds:F1}s. Mapping payload may be missing mediaStreams.",
                         ssrc,
                         orphanFor.TotalSeconds);
@@ -119,36 +125,11 @@ public sealed class ParticipantAudioRouter
 
         if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
         {
-            _logger.LogWarning("ROUTER[MAP] SSRC/sourceId {Ssrc} mapped but participant details not resolved yet.", ssrc);
+            BufferOrphanedAudio(ssrc, rawPayload, timestampHns);
+            _logger.LogWarning("ROUTER[MAP] SSRC/sourceId {Ssrc} mapped but participant details not resolved yet. Buffering until reconcile.", ssrc);
             return;
         }
-
-        if (_audioBuffer.TryRemove(ssrc, out var bufferedFrames))
-        {
-            var framesToReplay = new List<BufferedFrame>();
-            lock (bufferedFrames)
-            {
-                while (bufferedFrames.Count > 0)
-                {
-                    var buffered = bufferedFrames.Dequeue();
-                    if ((DateTime.UtcNow - buffered.EnqueuedUtc) > BufferTimeout)
-                    {
-                        continue;
-                    }
-
-                    framesToReplay.Add(buffered);
-                }
-            }
-
-            _logger.LogInformation(
-                "ROUTER[FLUSH] Replaying {Count} buffered frames for SSRC/sourceId {Ssrc}.",
-                framesToReplay.Count,
-                ssrc);
-            foreach (var buffered in framesToReplay)
-            {
-                await ProcessWithIdentity(ssrc, participant, buffered.Payload, buffered.TimestampHns);
-            }
-        }
+        await FlushOrphanedAudio(ssrc, participant);
 
         await ProcessWithIdentity(ssrc, participant, rawPayload, timestampHns);
     }
@@ -169,7 +150,7 @@ public sealed class ParticipantAudioRouter
         await _azureSpeech.ProcessAudioAsync(ssrc, participant, pcm, timestampHns);
     }
 
-    private void BufferUnmappedAudio(uint ssrc, byte[] rawPayload, long timestampHns)
+    private void BufferOrphanedAudio(uint ssrc, byte[] rawPayload, long timestampHns)
     {
         var queue = _audioBuffer.GetOrAdd(ssrc, _ => new Queue<BufferedFrame>());
         var droppedForCapacity = 0;
@@ -191,9 +172,9 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    private async Task FlushBufferedAsync(uint ssrc)
+    public async Task FlushOrphanedAudio(uint sourceId, TranscriptionParticipant identity)
     {
-        if (!_audioBuffer.TryRemove(ssrc, out var queue))
+        if (!_audioBuffer.TryRemove(sourceId, out var queue))
         {
             return;
         }
@@ -218,20 +199,85 @@ public sealed class ParticipantAudioRouter
 
         _logger.LogInformation(
             "ROUTER[FLUSH] SSRC/sourceId {Ssrc}: replaying={ReplayCount}, droppedExpired={DroppedExpired}.",
-            ssrc,
+            sourceId,
             framesToReplay.Count,
             droppedExpired);
 
         foreach (var frame in framesToReplay)
         {
-            if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
+            await ProcessWithIdentity(sourceId, identity, frame.Payload, frame.TimestampHns);
+        }
+    }
+
+    /// <summary>
+    /// Late-binding entry point: once sourceId mapping is known, update speech identity and flush buffered frames.
+    /// </summary>
+    public async Task ReconcileSsrcAsync(uint sourceId)
+    {
+        TranscriptionParticipant? identity = null;
+        if (_meetingParticipants.TryGetTranscriptionParticipant(sourceId, out var meetingIdentity))
+        {
+            identity = meetingIdentity;
+        }
+        else if (_participantManager.TryGetBinding(sourceId, out var binding) && binding is not null)
+        {
+            var fallbackId = string.IsNullOrWhiteSpace(binding.EntraOid)
+                ? $"msi-pending-{sourceId}"
+                : binding.EntraOid.Trim();
+            var fallbackName = string.IsNullOrWhiteSpace(binding.DisplayName)
+                ? _participantManager.GetTranscriptSpeakerLabel(sourceId)
+                : binding.DisplayName.Trim();
+            if (string.IsNullOrWhiteSpace(fallbackName))
             {
-                _logger.LogWarning("ROUTER[FLUSH] SSRC/sourceId {Ssrc}: participant could not be resolved during replay.", ssrc);
-                break;
+                fallbackName = fallbackId;
             }
 
-            await ProcessWithIdentity(ssrc, participant, frame.Payload, frame.TimestampHns);
+            identity = new TranscriptionParticipant(fallbackId, fallbackName, fallbackId);
         }
+
+        if (identity is null)
+        {
+            _logger.LogWarning("ROUTER[RECONCILE] sourceId/SSRC {Ssrc} mapped but identity not available yet.", sourceId);
+            return;
+        }
+
+        await _azureSpeech.UpdateIdentityAsync(sourceId, identity).ConfigureAwait(false);
+        await FlushBufferedAsync(sourceId, identity).ConfigureAwait(false);
+    }
+
+    private Task FlushBufferedAsync(uint sourceId, TranscriptionParticipant identity) =>
+        FlushOrphanedAudio(sourceId, identity);
+
+    private bool IsOrphan(uint ssrc)
+    {
+        if (!_unmappedSsrcFirstSeen.TryGetValue(ssrc, out var firstSeen))
+        {
+            return false;
+        }
+
+        return (DateTime.UtcNow - firstSeen) >= TimeSpan.FromSeconds(30);
+    }
+
+    private void MaybeRescanParticipantMediaStreams()
+    {
+        var call = _attachedCall;
+        var botId = _botClientId;
+        if (call is null || string.IsNullOrWhiteSpace(botId))
+        {
+            return;
+        }
+
+        lock (_rescanLock)
+        {
+            if ((DateTime.UtcNow - _lastParticipantRescanUtc) < TimeSpan.FromSeconds(2))
+            {
+                return;
+            }
+
+            _lastParticipantRescanUtc = DateTime.UtcNow;
+        }
+
+        TryHydrateFromCurrentRoster(call, botId);
     }
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
@@ -262,7 +308,7 @@ public sealed class ParticipantAudioRouter
         _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
 
         var callPartId = resource?.Id;
-        var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
+        var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource, _logger).ToList();
         if (sourceIds.Count == 0 && !string.IsNullOrWhiteSpace(callPartId) && _attachedCall is not null)
         {
             // OnUpdated can provide partial delta resources; retry against the current participant object.
@@ -275,7 +321,7 @@ public sealed class ParticipantAudioRouter
                         continue;
                     }
 
-                    sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(current.Resource);
+                    sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(current.Resource, _logger).ToList();
                     if (sourceIds.Count > 0)
                     {
                         _logger.LogInformation(
@@ -299,6 +345,11 @@ public sealed class ParticipantAudioRouter
             }
         }
 
+        if (!sourceIds.Any())
+        {
+            _logger.LogWarning("No sourceIds found for participant {Name}", dn);
+        }
+
         foreach (var sourceId in sourceIds)
         {
             if (!string.IsNullOrWhiteSpace(callPartId))
@@ -310,7 +361,7 @@ public sealed class ParticipantAudioRouter
             _logger.LogInformation("[SSRC BIND] sourceId {SourceId} -> {DisplayName} ({ParticipantId})", sourceId, dn, pid);
             _unmappedSsrcLogThrottle.TryRemove(sourceId, out _);
             _unmappedSsrcFirstSeen.TryRemove(sourceId, out _);
-            _ = FlushBufferedAsync(sourceId);
+            _ = _meetingParticipants.ReconcilePendingAudio(sourceId, pid);
         }
     }
 

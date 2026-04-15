@@ -12,9 +12,9 @@ public sealed class TranscriptItem
     public required DateTime Timestamp { get; init; }
 
     /// <summary>Entra object id (GUID) when resolved; otherwise synthetic e.g. <c>msi-pending-{sourceId}</c>.</summary>
-    public required string EntraObjectId { get; init; }
+    public required string EntraObjectId { get; set; }
 
-    public required string ParticipantName { get; init; }
+    public required string ParticipantName { get; set; }
     public required string Text { get; init; }
     public uint? SourceStreamId { get; init; }
 }
@@ -181,6 +181,64 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
                 await FlushWindowAsync(window, flag: null, cancellationToken);
             }
         }
+    }
+
+    public Task<int> ReconcileRecentIdentityAsync(
+        uint sourceId,
+        string participantId,
+        string displayName,
+        TimeSpan lookback,
+        CancellationToken cancellationToken = default)
+    {
+        var sinceUtc = DateTime.UtcNow - lookback;
+        var updated = 0;
+        lock (_lock)
+        {
+            if (_currentWindow is null)
+            {
+                return Task.FromResult(0);
+            }
+
+            foreach (var item in _currentWindow.Fragments)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (item.SourceStreamId != sourceId)
+                {
+                    continue;
+                }
+
+                if (item.Timestamp < sinceUtc)
+                {
+                    continue;
+                }
+
+                // Late-binding patch: replace temporary speaker placeholders once identity resolves.
+                var pendingPrefix = $"msi-pending-{sourceId}";
+                var isPendingId = item.EntraObjectId.StartsWith(pendingPrefix, StringComparison.OrdinalIgnoreCase);
+                var isPendingName = item.ParticipantName.StartsWith("Unknown", StringComparison.OrdinalIgnoreCase) ||
+                                    item.ParticipantName.StartsWith("msi-pending-", StringComparison.OrdinalIgnoreCase);
+                if (!isPendingId && !isPendingName && !string.Equals(item.EntraObjectId, participantId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                item.EntraObjectId = participantId;
+                item.ParticipantName = displayName;
+                updated++;
+            }
+        }
+
+        if (updated > 0)
+        {
+            _logger.LogInformation(
+                "CHUNK[RECONCILE] Updated {Count} recent transcript fragments for sourceId={SourceId} -> {DisplayName} ({ParticipantId}).",
+                updated,
+                sourceId,
+                displayName,
+                participantId);
+        }
+
+        return Task.FromResult(updated);
     }
 
     /// <summary>Timer-driven: close chunks when wall clock passes chunk end (handles silence with empty payloads).</summary>
