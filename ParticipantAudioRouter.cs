@@ -23,11 +23,10 @@ public sealed class ParticipantAudioRouter
 
     private ICall? _attachedCall;
     private string _botClientId = string.Empty;
-    private readonly object _rescanLock = new();
-    private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
     private readonly ConcurrentDictionary<uint, DateTime> _unmappedSsrcLogThrottle = new();
     private readonly ConcurrentDictionary<uint, Queue<BufferedFrame>> _audioBuffer = new();
-    private static readonly TimeSpan BufferTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan BufferTimeout = TimeSpan.FromSeconds(12);
+    private const int MaxBufferedFramesPerSsrc = 120;
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -49,10 +48,6 @@ public sealed class ParticipantAudioRouter
     {
         _attachedCall = call;
         _botClientId = botClientId ?? string.Empty;
-        lock (_rescanLock)
-        {
-            _lastParticipantRescanUtc = DateTime.MinValue;
-        }
 
         var bot = _botClientId;
         call.Participants.OnUpdated += (_, args) =>
@@ -96,8 +91,6 @@ public sealed class ParticipantAudioRouter
     /// </summary>
     public async Task HandleAudioAsync(uint ssrc, byte[] rawPayload, long timestampHns)
     {
-        MaybeRescanParticipantMediaStreams();
-
         if (!_ssrcMapper.HasMapping(ssrc))
         {
             BufferUnmappedAudio(ssrc, rawPayload, timestampHns);
@@ -167,6 +160,10 @@ public sealed class ParticipantAudioRouter
         lock (queue)
         {
             queue.Enqueue(new BufferedFrame(rawPayload, timestampHns, DateTime.UtcNow));
+            while (queue.Count > MaxBufferedFramesPerSsrc)
+            {
+                queue.Dequeue();
+            }
             while (queue.Count > 0 && (DateTime.UtcNow - queue.Peek().EnqueuedUtc) > BufferTimeout)
             {
                 queue.Dequeue();
@@ -174,36 +171,34 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    private void MaybeRescanParticipantMediaStreams()
+    private async Task FlushBufferedAsync(uint ssrc)
     {
-        var call = _attachedCall;
-        var botId = _botClientId;
-        if (call is null || string.IsNullOrWhiteSpace(botId))
+        if (!_audioBuffer.TryRemove(ssrc, out var queue))
         {
             return;
         }
 
-        lock (_rescanLock)
+        var framesToReplay = new List<BufferedFrame>();
+        lock (queue)
         {
-            if ((DateTime.UtcNow - _lastParticipantRescanUtc).TotalSeconds < 2.5)
+            while (queue.Count > 0)
             {
-                return;
-            }
-
-            _lastParticipantRescanUtc = DateTime.UtcNow;
-        }
-
-        try
-        {
-            _meetingParticipants.ResyncParticipantMediaStreamsFromCall(call, botId);
-            foreach (var p in call.Participants)
-            {
-                UpsertParticipantMappings(p, botId);
+                var frame = queue.Dequeue();
+                if ((DateTime.UtcNow - frame.EnqueuedUtc) <= BufferTimeout)
+                {
+                    framesToReplay.Add(frame);
+                }
             }
         }
-        catch (Exception ex)
+
+        foreach (var frame in framesToReplay)
         {
-            _logger.LogDebug(ex, "Periodic participant mediaStreams rescan failed.");
+            if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
+            {
+                break;
+            }
+
+            await ProcessWithIdentity(ssrc, participant, frame.Payload, frame.TimestampHns);
         }
     }
 
@@ -244,6 +239,8 @@ public sealed class ParticipantAudioRouter
 
             _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
             _logger.LogInformation("[SSRC BIND] sourceId {SourceId} -> {DisplayName} ({ParticipantId})", sourceId, dn, pid);
+            _unmappedSsrcLogThrottle.TryRemove(sourceId, out _);
+            _ = FlushBufferedAsync(sourceId);
         }
     }
 
