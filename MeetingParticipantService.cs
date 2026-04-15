@@ -314,7 +314,7 @@ public sealed class MeetingParticipantService
             _noSourceLogThrottle[throttleKey] = DateTime.UtcNow;
 
             _logger.LogWarning(
-                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; unmixed audio for this user is dropped until Graph publishes stream ids.",
+                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; unmixed audio for this user is buffered briefly until Graph publishes stream ids.",
                 azureUserId);
         }
 

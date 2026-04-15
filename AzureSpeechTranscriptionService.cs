@@ -129,6 +129,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                     return;
                 }
 
+                _logger.LogInformation("TRANSCRIPT [{DisplayName}]: {Text}", participant.DisplayName, text);
                 var conf = TryParseConfidence(e.Result);
                 _ = EmitTranscriptAsync(ssrc, participant, text, conf);
             };

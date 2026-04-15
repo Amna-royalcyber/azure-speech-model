@@ -12,6 +12,8 @@ namespace TeamsMediaBot;
 /// </summary>
 public sealed class ParticipantAudioRouter
 {
+    private sealed record BufferedFrame(byte[] Payload, long TimestampHns, DateTime EnqueuedUtc);
+
     private readonly AudioProcessor _audioProcessor;
     private readonly AzureSpeechTranscriptionService _azureSpeech;
     private readonly MeetingParticipantService _meetingParticipants;
@@ -24,6 +26,8 @@ public sealed class ParticipantAudioRouter
     private readonly object _rescanLock = new();
     private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
     private readonly ConcurrentDictionary<uint, DateTime> _unmappedSsrcLogThrottle = new();
+    private readonly ConcurrentDictionary<uint, Queue<BufferedFrame>> _audioBuffer = new();
+    private static readonly TimeSpan BufferTimeout = TimeSpan.FromSeconds(3);
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -96,11 +100,15 @@ public sealed class ParticipantAudioRouter
 
         if (!_ssrcMapper.HasMapping(ssrc))
         {
+            BufferUnmappedAudio(ssrc, rawPayload, timestampHns);
             if (!_unmappedSsrcLogThrottle.TryGetValue(ssrc, out var last) ||
                 (DateTime.UtcNow - last) >= TimeSpan.FromSeconds(10))
             {
                 _unmappedSsrcLogThrottle[ssrc] = DateTime.UtcNow;
-                _logger.LogWarning("Dropping audio: SSRC/sourceId {Ssrc} is not mapped yet.", ssrc);
+                _logger.LogWarning(
+                    "Buffering audio: SSRC/sourceId {Ssrc} is not mapped yet (buffer timeout {TimeoutSeconds}s).",
+                    ssrc,
+                    BufferTimeout.TotalSeconds);
             }
             return;
         }
@@ -110,6 +118,34 @@ public sealed class ParticipantAudioRouter
             return;
         }
 
+        if (_audioBuffer.TryRemove(ssrc, out var bufferedFrames))
+        {
+            var framesToReplay = new List<BufferedFrame>();
+            lock (bufferedFrames)
+            {
+                while (bufferedFrames.Count > 0)
+                {
+                    var buffered = bufferedFrames.Dequeue();
+                    if ((DateTime.UtcNow - buffered.EnqueuedUtc) > BufferTimeout)
+                    {
+                        continue;
+                    }
+
+                    framesToReplay.Add(buffered);
+                }
+            }
+
+            foreach (var buffered in framesToReplay)
+            {
+                await ProcessWithIdentity(ssrc, participant, buffered.Payload, buffered.TimestampHns);
+            }
+        }
+
+        await ProcessWithIdentity(ssrc, participant, rawPayload, timestampHns);
+    }
+
+    private async Task ProcessWithIdentity(uint ssrc, TranscriptionParticipant participant, byte[] rawPayload, long timestampHns)
+    {
         var pcm = _audioProcessor.ConvertToPcm(new AudioFrame(
             Data: rawPayload,
             Timestamp: timestampHns,
@@ -122,8 +158,20 @@ public sealed class ParticipantAudioRouter
         }
 
         _logger.LogDebug("PCM for SSRC {Ssrc} ({Name}).", ssrc, participant.DisplayName);
-
         await _azureSpeech.ProcessAudioAsync(ssrc, participant, pcm, timestampHns);
+    }
+
+    private void BufferUnmappedAudio(uint ssrc, byte[] rawPayload, long timestampHns)
+    {
+        var queue = _audioBuffer.GetOrAdd(ssrc, _ => new Queue<BufferedFrame>());
+        lock (queue)
+        {
+            queue.Enqueue(new BufferedFrame(rawPayload, timestampHns, DateTime.UtcNow));
+            while (queue.Count > 0 && (DateTime.UtcNow - queue.Peek().EnqueuedUtc) > BufferTimeout)
+            {
+                queue.Dequeue();
+            }
+        }
     }
 
     private void MaybeRescanParticipantMediaStreams()
