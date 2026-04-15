@@ -174,8 +174,14 @@ public sealed class ParticipantAudioRouter
 
     public async Task FlushOrphanedAudio(uint sourceId, TranscriptionParticipant identity)
     {
+        var bufferedCountBeforeFlush = GetBufferedFrameCount(sourceId);
         if (!_audioBuffer.TryRemove(sourceId, out var queue))
         {
+            _logger.LogInformation(
+                "ROUTER[FLUSH] sourceId/SSRC {Ssrc}: no buffered frames to flush. resolvedParticipant={ParticipantId}, displayName={DisplayName}.",
+                sourceId,
+                identity.ParticipantId,
+                identity.DisplayName);
             return;
         }
 
@@ -198,10 +204,13 @@ public sealed class ParticipantAudioRouter
         }
 
         _logger.LogInformation(
-            "ROUTER[FLUSH] SSRC/sourceId {Ssrc}: replaying={ReplayCount}, droppedExpired={DroppedExpired}.",
+            "ROUTER[FLUSH] SSRC/sourceId {Ssrc}: bufferedBeforeFlush={BufferedBeforeFlush}, replaying={ReplayCount}, droppedExpired={DroppedExpired}, resolvedParticipant={ParticipantId}, displayName={DisplayName}.",
             sourceId,
+            bufferedCountBeforeFlush,
             framesToReplay.Count,
-            droppedExpired);
+            droppedExpired,
+            identity.ParticipantId,
+            identity.DisplayName);
 
         foreach (var frame in framesToReplay)
         {
@@ -214,6 +223,7 @@ public sealed class ParticipantAudioRouter
     /// </summary>
     public async Task ReconcileSsrcAsync(uint sourceId)
     {
+        var bufferedCount = GetBufferedFrameCount(sourceId);
         TranscriptionParticipant? identity = null;
         if (_meetingParticipants.TryGetTranscriptionParticipant(sourceId, out var meetingIdentity))
         {
@@ -241,12 +251,32 @@ public sealed class ParticipantAudioRouter
             return;
         }
 
+        _logger.LogInformation(
+            "ROUTER[RECONCILE] sourceId/SSRC {Ssrc}: bufferedFrames={BufferedFrames}, participant={ParticipantId}, displayName={DisplayName}.",
+            sourceId,
+            bufferedCount,
+            identity.ParticipantId,
+            identity.DisplayName);
+
         await _azureSpeech.UpdateIdentityAsync(sourceId, identity).ConfigureAwait(false);
         await FlushBufferedAsync(sourceId, identity).ConfigureAwait(false);
     }
 
     private Task FlushBufferedAsync(uint sourceId, TranscriptionParticipant identity) =>
         FlushOrphanedAudio(sourceId, identity);
+
+    private int GetBufferedFrameCount(uint sourceId)
+    {
+        if (!_audioBuffer.TryGetValue(sourceId, out var queue))
+        {
+            return 0;
+        }
+
+        lock (queue)
+        {
+            return queue.Count;
+        }
+    }
 
     private bool IsOrphan(uint ssrc)
     {
