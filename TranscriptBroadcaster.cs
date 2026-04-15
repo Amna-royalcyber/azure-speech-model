@@ -28,6 +28,12 @@ public sealed class TranscriptBroadcaster
     {
         try
         {
+            _logger.LogDebug(
+                "BROADCAST[TRANSCRIPT] Emitting transcript: ssrc={Ssrc}, participant={ParticipantId}, intra={IntraId}, chars={Chars}.",
+                ssrc,
+                participantId,
+                intraId,
+                text.Length);
             await _hubContext.Clients.All.SendAsync(
                 "transcript",
                 new
@@ -57,6 +63,11 @@ public sealed class TranscriptBroadcaster
     {
         try
         {
+            _logger.LogDebug(
+                "BROADCAST[IDENTITY] Updating transcript identity: sourceId={SourceId}, displayName={DisplayName}, participantId={ParticipantId}.",
+                sourceId,
+                displayName,
+                entraOid);
             await _hubContext.Clients.All.SendAsync("transcript-update", new
             {
                 type = "transcript-update",
@@ -76,6 +87,7 @@ public sealed class TranscriptBroadcaster
     {
         try
         {
+            _logger.LogDebug("BROADCAST[ROSTER] Emitting roster with {Count} participants.", participants.Count);
             await _hubContext.Clients.All.SendAsync("roster", new
             {
                 participants = participants.Select(p => new

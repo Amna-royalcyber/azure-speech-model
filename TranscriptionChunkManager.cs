@@ -130,6 +130,12 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
         }
 
         var utc = utteranceUtc.Kind == DateTimeKind.Utc ? utteranceUtc : utteranceUtc.ToUniversalTime();
+        _logger.LogDebug(
+            "CHUNK[RECORD] Final transcript received: participantId={ParticipantId}, speaker={Speaker}, sourceId={SourceId}, chars={Chars}.",
+            participantId,
+            speakerName,
+            sourceStreamId,
+            text.Length);
 
         List<TimeWindowChunk>? windowsToFlush = null;
         lock (_lock)
@@ -154,6 +160,7 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
 
             if (!_dedupeKeys.Add(dedupeKey))
             {
+                _logger.LogDebug("CHUNK[RECORD] Duplicate transcript dropped by dedupe key.");
                 return;
             }
 
@@ -237,6 +244,11 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
         }
 
         var ordered = window.Fragments.OrderBy(i => i.Timestamp).ToList();
+        _logger.LogDebug(
+            "CHUNK[FLUSH] Preparing window flush Start={Start}, End={End}, RawLines={RawLines}.",
+            window.StartTime,
+            window.EndTime,
+            ordered.Count);
         var transcriptList = new List<AlbTranscriptLine>();
         foreach (var fragment in ordered)
         {

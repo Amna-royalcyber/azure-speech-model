@@ -74,19 +74,27 @@ public sealed class MediaHandler
                 return;
             }
 
+            _logger.LogDebug("MEDIA[INGEST] Received frame with {UnmixedCount} unmixed buffers.", unmixed.Count());
             foreach (var ub in unmixed)
             {
                 if (!UnmixedAudioHelpers.TryGetSsrc(ub, out var ssrc))
                 {
+                    _logger.LogDebug("MEDIA[INGEST] Skipping unmixed buffer without resolvable sourceId.");
                     continue;
                 }
 
                 var payload = UnmixedAudioHelpers.CopyPayload(ub.Data, ub.Length);
                 if (payload.Length == 0)
                 {
+                    _logger.LogDebug("MEDIA[INGEST] Skipping empty payload for SSRC/sourceId {Ssrc}.", ssrc);
                     continue;
                 }
 
+                _logger.LogDebug(
+                    "MEDIA[INGEST] Forwarding SSRC/sourceId {Ssrc}, bytes={Bytes}, ts={TimestampHns}.",
+                    ssrc,
+                    payload.Length,
+                    ub.OriginalSenderTimestamp);
                 await _participantAudioRouter.HandleAudioAsync(ssrc, payload, ub.OriginalSenderTimestamp);
             }
         }

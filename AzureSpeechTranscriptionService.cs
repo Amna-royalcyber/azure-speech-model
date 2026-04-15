@@ -65,6 +65,13 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
         }
 
         var session = _sessions.GetOrAdd(ssrc, _ => new StreamSession());
+        _logger.LogDebug(
+            "SPEECH[INGEST] SSRC/sourceId {Ssrc}, bytes={Bytes}, ts={TimestampHns}, participant={DisplayName} ({ParticipantId}).",
+            ssrc,
+            pcm16kMono.Length,
+            timestampHns,
+            participant.DisplayName,
+            participant.ParticipantId);
         await session.Serialize.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -80,6 +87,11 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
 
             if (shouldStart)
             {
+                _logger.LogInformation(
+                    "SPEECH[START] Creating recognizer for SSRC/sourceId {Ssrc}, participant={DisplayName} ({ParticipantId}).",
+                    ssrc,
+                    participant.DisplayName,
+                    participant.ParticipantId);
                 await StartRecognizerAsync(session, ssrc, participant).ConfigureAwait(false);
             }
 
@@ -88,6 +100,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 if (session.Push is not null)
                 {
                     session.Push.Write(pcm16kMono);
+                    _logger.LogDebug("SPEECH[WRITE] Wrote PCM to recognizer for SSRC/sourceId {Ssrc}.", ssrc);
                 }
             }
         }
@@ -143,6 +156,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
             };
 
             await recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
+            _logger.LogInformation("SPEECH[START] Recognizer started for SSRC/sourceId {Ssrc}.", ssrc);
 
             lock (session.Gate)
             {
@@ -180,6 +194,11 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 text,
                 dedupeKey,
                 ssrc).ConfigureAwait(false);
+            _logger.LogDebug(
+                "SPEECH[EMIT] Emitted final transcript for SSRC/sourceId {Ssrc}, participant={DisplayName}, chars={Length}.",
+                ssrc,
+                participant.DisplayName,
+                text.Length);
         }
         catch (Exception ex)
         {
@@ -189,6 +208,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("SPEECH[DISPOSE] Disposing Azure speech service sessions: {SessionCount}.", _sessions.Count);
         _disposed = true;
         foreach (var kv in _sessions.ToArray())
         {

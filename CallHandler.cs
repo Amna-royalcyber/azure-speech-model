@@ -136,6 +136,10 @@ public sealed class CallHandler
         }
 
         _logger.LogInformation("Joining with TenantId={TenantId}, Organizer={Organizer}", joinTenantId, organizerObjectId);
+        _logger.LogDebug(
+            "FLOW[JOIN] Building media session and join params for threadId={ThreadId}, messageId={MessageId}.",
+            chatInfo.ThreadId,
+            chatInfo.MessageId);
 
         // Align with Microsoft Graph comms samples (e.g. HueBot JoinCallAsync): 3-arg ctor + explicit scenario id.
         var mediaSession = mediaHandler.CreateMediaSession(_communicationsClient);
@@ -227,6 +231,7 @@ public sealed class CallHandler
             _activeCall = call;
         }
 
+        _logger.LogDebug("FLOW[JOIN] Pipeline attached: participants, router, chunk manager, meeting context.");
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
         return call;
     }

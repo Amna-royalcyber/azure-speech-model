@@ -60,6 +60,7 @@ public sealed class MeetingParticipantService
         var intra = string.IsNullOrWhiteSpace(intraId) ? pid : intraId.Trim();
 
         _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
+        _logger.LogDebug("MAP[PARTICIPANT] Registered/updated participant {DisplayName} ({ParticipantId}), intra={IntraId}.", dn, pid, intra);
 
         lock (_lock)
         {
@@ -116,6 +117,7 @@ public sealed class MeetingParticipantService
         _audioSourceIdToAzureObjectId[sourceId] = e;
         _sourceIdToCallParticipantId[sourceId] = intra;
         _ssrcMapper.Bind(sourceId, e);
+        _logger.LogDebug("MAP[BIND] sourceId/SSRC {SourceId} -> participant {ParticipantId}, intra={IntraId}.", sourceId, e, intra);
     }
 
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
@@ -198,6 +200,7 @@ public sealed class MeetingParticipantService
         displayName = string.Empty;
         if (!_audioSourceIdToAzureObjectId.TryGetValue(sourceId, out var oid) || string.IsNullOrWhiteSpace(oid))
         {
+            _logger.LogDebug("MAP[LOOKUP] sourceId/SSRC {SourceId} not mapped yet.", sourceId);
             return false;
         }
 
@@ -285,9 +288,20 @@ public sealed class MeetingParticipantService
 
         var needsGraph = string.IsNullOrWhiteSpace(displayName);
 
+        _logger.LogDebug(
+            "MAP[INGEST] Participant event: participantId={ParticipantId}, intra={IntraId}, displayName={DisplayName}, needsGraphEnrichment={NeedsGraph}.",
+            azureUserId,
+            callPartId,
+            displayName ?? azureUserId,
+            needsGraph);
+
         AddOrUpdateParticipant(azureUserId, displayName ?? azureUserId, callPartId);
 
         var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
+        _logger.LogDebug(
+            "MAP[INGEST] Parsed {SourceCount} sourceIds for participant {ParticipantId}.",
+            sourceIds.Count,
+            azureUserId);
         foreach (var sid in sourceIds)
         {
             BindMediaStreamToParticipant(sid, azureUserId, callPartId);
@@ -330,9 +344,11 @@ public sealed class MeetingParticipantService
     {
         try
         {
+            _logger.LogDebug("MAP[GRAPH] Enriching participant profile for {ParticipantId}.", azureUserId);
             var profile = await _entra.GetUserAsync(azureUserId).ConfigureAwait(false);
             if (profile is null)
             {
+                _logger.LogDebug("MAP[GRAPH] No profile found for {ParticipantId}.", azureUserId);
                 return;
             }
 
@@ -357,6 +373,7 @@ public sealed class MeetingParticipantService
             }
 
             await PublishRosterAsync().ConfigureAwait(false);
+            _logger.LogDebug("MAP[GRAPH] Enrichment applied for {ParticipantId}.", azureUserId);
         }
         catch (Exception ex)
         {
@@ -393,6 +410,10 @@ public sealed class MeetingParticipantService
                     _audioSourceIdToAzureObjectId.TryRemove(kv.Key, out _);
                     _sourceIdToCallParticipantId.TryRemove(kv.Key, out _);
                     _ssrcMapper.RemoveSsrc(kv.Key);
+                    _logger.LogInformation(
+                        "MAP[REMOVE] Removed sourceId/SSRC {SourceId} mapping for participant {ParticipantId}.",
+                        kv.Key,
+                        removedAzureId);
                 }
             }
         }

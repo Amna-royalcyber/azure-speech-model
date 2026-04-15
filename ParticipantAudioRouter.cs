@@ -91,6 +91,12 @@ public sealed class ParticipantAudioRouter
     /// </summary>
     public async Task HandleAudioAsync(uint ssrc, byte[] rawPayload, long timestampHns)
     {
+        _logger.LogDebug(
+            "ROUTER[RECV] SSRC/sourceId {Ssrc}, bytes={Bytes}, ts={TimestampHns}.",
+            ssrc,
+            rawPayload.Length,
+            timestampHns);
+
         if (!_ssrcMapper.HasMapping(ssrc))
         {
             BufferUnmappedAudio(ssrc, rawPayload, timestampHns);
@@ -106,8 +112,10 @@ public sealed class ParticipantAudioRouter
             return;
         }
 
+        _logger.LogDebug("ROUTER[MAP] SSRC/sourceId {Ssrc} has mapping.", ssrc);
         if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
         {
+            _logger.LogWarning("ROUTER[MAP] SSRC/sourceId {Ssrc} mapped but participant details not resolved yet.", ssrc);
             return;
         }
 
@@ -128,6 +136,10 @@ public sealed class ParticipantAudioRouter
                 }
             }
 
+            _logger.LogInformation(
+                "ROUTER[FLUSH] Replaying {Count} buffered frames for SSRC/sourceId {Ssrc}.",
+                framesToReplay.Count,
+                ssrc);
             foreach (var buffered in framesToReplay)
             {
                 await ProcessWithIdentity(ssrc, participant, buffered.Payload, buffered.TimestampHns);
@@ -147,27 +159,44 @@ public sealed class ParticipantAudioRouter
 
         if (pcm.Length == 0)
         {
+            _logger.LogDebug("ROUTER[PCM] Converted PCM empty for SSRC/sourceId {Ssrc}; frame dropped.", ssrc);
             return;
         }
 
-        _logger.LogDebug("PCM for SSRC {Ssrc} ({Name}).", ssrc, participant.DisplayName);
+        _logger.LogDebug(
+            "ROUTER[PCM] SSRC/sourceId {Ssrc} -> participant {DisplayName} ({ParticipantId}), pcmBytes={Bytes}.",
+            ssrc,
+            participant.DisplayName,
+            participant.ParticipantId,
+            pcm.Length);
         await _azureSpeech.ProcessAudioAsync(ssrc, participant, pcm, timestampHns);
     }
 
     private void BufferUnmappedAudio(uint ssrc, byte[] rawPayload, long timestampHns)
     {
         var queue = _audioBuffer.GetOrAdd(ssrc, _ => new Queue<BufferedFrame>());
+        var droppedForCapacity = 0;
+        var droppedForAge = 0;
         lock (queue)
         {
             queue.Enqueue(new BufferedFrame(rawPayload, timestampHns, DateTime.UtcNow));
             while (queue.Count > MaxBufferedFramesPerSsrc)
             {
                 queue.Dequeue();
+                droppedForCapacity++;
             }
             while (queue.Count > 0 && (DateTime.UtcNow - queue.Peek().EnqueuedUtc) > BufferTimeout)
             {
                 queue.Dequeue();
+                droppedForAge++;
             }
+
+            _logger.LogDebug(
+                "ROUTER[BUFFER] SSRC/sourceId {Ssrc}: queued frame, depth={Depth}, droppedCapacity={DroppedCapacity}, droppedAge={DroppedAge}.",
+                ssrc,
+                queue.Count,
+                droppedForCapacity,
+                droppedForAge);
         }
     }
 
@@ -175,10 +204,12 @@ public sealed class ParticipantAudioRouter
     {
         if (!_audioBuffer.TryRemove(ssrc, out var queue))
         {
+            _logger.LogDebug("ROUTER[FLUSH] No buffered audio for SSRC/sourceId {Ssrc}.", ssrc);
             return;
         }
 
         var framesToReplay = new List<BufferedFrame>();
+        var droppedExpired = 0;
         lock (queue)
         {
             while (queue.Count > 0)
@@ -188,13 +219,24 @@ public sealed class ParticipantAudioRouter
                 {
                     framesToReplay.Add(frame);
                 }
+                else
+                {
+                    droppedExpired++;
+                }
             }
         }
+
+        _logger.LogInformation(
+            "ROUTER[FLUSH] SSRC/sourceId {Ssrc}: replaying={ReplayCount}, droppedExpired={DroppedExpired}.",
+            ssrc,
+            framesToReplay.Count,
+            droppedExpired);
 
         foreach (var frame in framesToReplay)
         {
             if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
             {
+                _logger.LogWarning("ROUTER[FLUSH] SSRC/sourceId {Ssrc}: participant could not be resolved during replay.", ssrc);
                 break;
             }
 
@@ -228,6 +270,7 @@ public sealed class ParticipantAudioRouter
         var pid = participantId.Trim();
         var dn = displayName.Trim();
         _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
+        _logger.LogDebug("ROUTER[ROSTER] Participant update: {DisplayName} ({ParticipantId}).", dn, pid);
 
         var callPartId = resource?.Id;
         foreach (var sourceId in GraphParticipantMediaStreams.ExtractSourceIds(resource))
