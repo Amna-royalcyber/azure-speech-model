@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Graph.Models;
 
@@ -92,9 +93,20 @@ internal static class GraphParticipantMediaStreams
     public static List<uint> ExtractSourceIds(Participant? participant)
     {
         var list = new List<uint>();
-        if (participant?.AdditionalData is null)
+        if (participant is null)
         {
-            Console.WriteLine("[CONSOLE][MAP][EXTRACT] participant additionalData is null; no sourceIds.");
+            return list;
+        }
+
+        // 1) SDK-typed or reflected MediaStreams first (works when AdditionalData does not carry mediaStreams).
+        TryAddSourceIdsFromTypedOrReflectedMediaStreams(participant, list);
+        if (list.Count > 0)
+        {
+            return list.Distinct().ToList();
+        }
+
+        if (participant.AdditionalData is null)
+        {
             return list;
         }
 
@@ -110,7 +122,6 @@ internal static class GraphParticipantMediaStreams
 
         if (msObj is null)
         {
-            Console.WriteLine("[CONSOLE][MAP][EXTRACT] mediaStreams key missing in additionalData.");
             return list;
         }
 
@@ -125,7 +136,6 @@ internal static class GraphParticipantMediaStreams
             AddSourceIdsFromJsonElement(je, list);
             if (list.Count > 0)
             {
-                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds from JsonElement direct: [{string.Join(",", list)}]");
                 return list.Distinct().ToList();
             }
 
@@ -141,27 +151,16 @@ internal static class GraphParticipantMediaStreams
 
             if (list.Count > 0)
             {
-                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds after JsonElement raw parse: [{string.Join(",", list)}]");
                 return list.Distinct().ToList();
             }
 
             // Ultimate fallback: recursively search all AdditionalData for keys named sourceId.
             ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
-            if (list.Count == 0)
-            {
-                var keys = string.Join(", ", participant.AdditionalData.Keys);
-                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] recursive scan found 0 sourceIds. additionalData keys={keys}");
-            }
-            else
-            {
-                Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds after recursive scan: [{string.Join(",", list)}]");
-            }
             return list.Distinct().ToList();
         }
 
         if (msObj is string str && TryParseFromJson(str, list))
         {
-            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] sourceIds from string mediaStreams: [{string.Join(",", list)}]");
             return list;
         }
 
@@ -180,16 +179,58 @@ internal static class GraphParticipantMediaStreams
             ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
         }
 
-        if (list.Count == 0)
-        {
-            var keys = string.Join(", ", participant.AdditionalData.Keys);
-            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] final result: 0 sourceIds. additionalData keys={keys}");
-        }
-        else
-        {
-            Console.WriteLine($"[CONSOLE][MAP][EXTRACT] final sourceIds: [{string.Join(",", list)}]");
-        }
         return list.Distinct().ToList();
+    }
+
+    public static string BuildParticipantDiagnostics(Participant? participant, int maxChars = 2500)
+    {
+        if (participant is null)
+        {
+            return "participant=<null>";
+        }
+
+        var keys = participant.AdditionalData is null
+            ? "<none>"
+            : string.Join(", ", participant.AdditionalData.Keys);
+
+        string additionalDataJson;
+        try
+        {
+            additionalDataJson = participant.AdditionalData is null
+                ? "{}"
+                : JsonSerializer.Serialize(participant.AdditionalData);
+        }
+        catch (Exception ex)
+        {
+            additionalDataJson = $"<serialize_error:{ex.GetType().Name}>";
+        }
+
+        if (additionalDataJson.Length > maxChars)
+        {
+            additionalDataJson = additionalDataJson[..maxChars] + "...<truncated>";
+        }
+
+        return $"id={participant.Id ?? "<null>"}; additionalDataKeys=[{keys}]; additionalData={additionalDataJson}";
+    }
+
+    private static void TryAddSourceIdsFromTypedOrReflectedMediaStreams(Participant participant, List<uint> list)
+    {
+        // Some Graph/Comms SDK builds expose MediaStreams as a typed property instead of AdditionalData.
+        var mediaStreams = GetPropertyValueCaseInsensitive(participant, "MediaStreams");
+        if (mediaStreams is null)
+        {
+            return;
+        }
+
+        ScanUnknownForSourceIds(mediaStreams, list);
+    }
+
+    private static object? GetPropertyValueCaseInsensitive(object instance, string propertyName)
+    {
+        var prop = instance.GetType().GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+        return prop?.GetValue(instance);
     }
 
     private static void AddSourceIdsFromJsonElement(JsonElement je, List<uint> list)

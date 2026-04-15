@@ -20,6 +20,7 @@ public sealed class MeetingParticipantService
     private readonly ILogger<MeetingParticipantService> _logger;
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<string, DateTime> _noSourceLogThrottle = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _payloadLogThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Call participant resource ids (for removals).</summary>
     private readonly Dictionary<string, string> _callParticipantIdToAzureUserId = new(StringComparer.OrdinalIgnoreCase);
@@ -136,17 +137,27 @@ public sealed class MeetingParticipantService
         {
             try
             {
-                foreach (var p in args.AddedResources)
+                var added = args.AddedResources ?? Array.Empty<IParticipant>();
+                var updated = args.UpdatedResources ?? Array.Empty<IParticipant>();
+                var removed = args.RemovedResources ?? Array.Empty<IParticipant>();
+
+                _logger.LogInformation(
+                    "GRAPH[PARTICIPANTS][DELTA] added={Added}, updated={Updated}, removed={Removed}.",
+                    added.Count,
+                    updated.Count,
+                    removed.Count);
+
+                foreach (var p in added)
                 {
                     IngestParticipant(p, botAzureAdApplicationClientId);
                 }
 
-                foreach (var p in args.UpdatedResources)
+                foreach (var p in updated)
                 {
                     IngestParticipant(p, botAzureAdApplicationClientId);
                 }
 
-                foreach (var p in args.RemovedResources)
+                foreach (var p in removed)
                 {
                     RemoveParticipant(p);
                 }
@@ -170,24 +181,6 @@ public sealed class MeetingParticipantService
         }
 
         _logger.LogInformation("Subscribed to call participant roster updates; Entra profiles resolved via Microsoft Graph when needed.");
-    }
-
-    /// <summary>
-    /// Re-ingests every participant resource (late <c>mediaStreams</c> / <c>sourceId</c>). Pair with <see cref="ParticipantAudioRouter"/> periodic rescan for demos.
-    /// </summary>
-    public void ResyncParticipantMediaStreamsFromCall(ICall call, string botAzureAdApplicationClientId)
-    {
-        try
-        {
-            foreach (var p in call.Participants)
-            {
-                IngestParticipant(p, botAzureAdApplicationClientId);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Resync participant mediaStreams from call failed.");
-        }
     }
 
     /// <summary>
@@ -295,6 +288,13 @@ public sealed class MeetingParticipantService
             displayName ?? azureUserId,
             needsGraph);
 
+        _logger.LogInformation(
+            "GRAPH[PARTICIPANT][RESOURCE] id={ResourceId}, participant={ParticipantId}, displayName={DisplayName}, additionalDataKeys={Keys}.",
+            callPartId,
+            azureUserId,
+            displayName ?? azureUserId,
+            resource.AdditionalData is null ? "<none>" : string.Join(", ", resource.AdditionalData.Keys));
+
         AddOrUpdateParticipant(azureUserId, displayName ?? azureUserId, callPartId);
 
         var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
@@ -302,11 +302,9 @@ public sealed class MeetingParticipantService
             "MAP[INGEST] Parsed {SourceCount} sourceIds for participant {ParticipantId}.",
             sourceIds.Count,
             azureUserId);
-        Console.WriteLine($"[CONSOLE][MAP][INGEST] participant={azureUserId}, intra={callPartId}, parsedSourceIds={sourceIds.Count}");
         foreach (var sid in sourceIds)
         {
             BindMediaStreamToParticipant(sid, azureUserId, callPartId);
-            Console.WriteLine($"[CONSOLE][MAP][BIND] sourceId={sid} -> participant={azureUserId}, intra={callPartId}");
             _logger.LogInformation(
                 "Authoritative stream map: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}); intra={IntraId}.",
                 sid,
@@ -317,6 +315,22 @@ public sealed class MeetingParticipantService
 
         if (sourceIds.Count == 0)
         {
+            var mediaStreamsValueKind = ReadAdditionalDataValueKind(resource.AdditionalData, "mediaStreams");
+            var mediaStreamsRaw = ReadAdditionalDataString(resource.AdditionalData, "mediaStreams");
+            if (!string.IsNullOrWhiteSpace(mediaStreamsRaw) && mediaStreamsRaw.Length > 1200)
+            {
+                mediaStreamsRaw = mediaStreamsRaw[..1200] + "...<truncated>";
+            }
+
+            if (!_payloadLogThrottle.TryGetValue(azureUserId, out var payloadLogAt) ||
+                (DateTime.UtcNow - payloadLogAt) >= TimeSpan.FromSeconds(30))
+            {
+                _payloadLogThrottle[azureUserId] = DateTime.UtcNow;
+                _logger.LogInformation(
+                    "MAP[PAYLOAD] Participant payload snapshot (safe): {Payload}",
+                    GraphParticipantMediaStreams.BuildParticipantDiagnostics(resource));
+            }
+
             var throttleKey = $"{azureUserId}:no-source";
             if (_noSourceLogThrottle.TryGetValue(throttleKey, out var last) && (DateTime.UtcNow - last) < TimeSpan.FromSeconds(30))
             {
@@ -334,14 +348,18 @@ public sealed class MeetingParticipantService
                 : string.Join(", ", resource.AdditionalData.Keys);
             var anonymized = ReadAdditionalDataBool(resource.AdditionalData, "isIdentityAnonymized");
             var voiceConsent = ReadAdditionalDataString(resource.AdditionalData, "aiVoiceConsent");
+            var rosterRole = ReadAdditionalDataString(resource.AdditionalData, "role");
+            var endpointType = ReadAdditionalDataString(resource.AdditionalData, "endpointType");
             _logger.LogWarning(
-                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; audio is buffered briefly until Graph publishes stream ids. AdditionalData keys={Keys}, isIdentityAnonymized={IsIdentityAnonymized}, aiVoiceConsent={AiVoiceConsent}.",
+                "GRAPH[STREAM][MISSING] Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams/sourceId yet; audio is buffered briefly until Graph publishes stream ids. additionalDataKeys={Keys}, mediaStreamsValueKind={MediaStreamsValueKind}, mediaStreamsRaw={MediaStreamsRaw}, isIdentityAnonymized={IsIdentityAnonymized}, aiVoiceConsent={AiVoiceConsent}, role={Role}, endpointType={EndpointType}.",
                 azureUserId,
                 keys,
+                mediaStreamsValueKind ?? "<missing>",
+                string.IsNullOrWhiteSpace(mediaStreamsRaw) ? "<missing>" : mediaStreamsRaw,
                 anonymized.HasValue ? anonymized.Value.ToString() : "<missing>",
-                string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent);
-            Console.WriteLine(
-                $"[CONSOLE][MAP][MISSING] participant={azureUserId}, additionalDataKeys={keys}, isIdentityAnonymized={(anonymized.HasValue ? anonymized.Value.ToString() : "<missing>")}, aiVoiceConsent={(string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent)}");
+                string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent,
+                string.IsNullOrWhiteSpace(rosterRole) ? "<missing>" : rosterRole,
+                string.IsNullOrWhiteSpace(endpointType) ? "<missing>" : endpointType);
         }
 
         _ = PublishRosterAsync();
@@ -537,6 +555,36 @@ public sealed class MeetingParticipantService
             }
 
             return Convert.ToString(value);
+        }
+
+        return null;
+    }
+
+    private static string? ReadAdditionalDataValueKind(IDictionary<string, object>? additionalData, string key)
+    {
+        if (additionalData is null)
+        {
+            return null;
+        }
+
+        foreach (var kv in additionalData)
+        {
+            if (!string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (kv.Value is null)
+            {
+                return "null";
+            }
+
+            if (kv.Value is JsonElement je)
+            {
+                return je.ValueKind.ToString();
+            }
+
+            return kv.Value.GetType().Name;
         }
 
         return null;

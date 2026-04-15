@@ -65,13 +65,6 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
         }
 
         var session = _sessions.GetOrAdd(ssrc, _ => new StreamSession());
-        _logger.LogDebug(
-            "SPEECH[INGEST] SSRC/sourceId {Ssrc}, bytes={Bytes}, ts={TimestampHns}, participant={DisplayName} ({ParticipantId}).",
-            ssrc,
-            pcm16kMono.Length,
-            timestampHns,
-            participant.DisplayName,
-            participant.ParticipantId);
         await session.Serialize.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -101,7 +94,6 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 if (session.Push is not null)
                 {
                     session.Push.Write(pcm16kMono);
-                    _logger.LogDebug("SPEECH[WRITE] Wrote PCM to recognizer for SSRC/sourceId {Ssrc}.", ssrc);
                 }
             }
         }
@@ -144,7 +136,6 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 }
 
                 _logger.LogInformation("TRANSCRIPT [{DisplayName}]: {Text}", participant.DisplayName, text);
-                Console.WriteLine($"[CONSOLE][SPEECH][TRANSCRIPT] sourceId={ssrc}, speaker={participant.DisplayName}, text={text}");
                 var conf = TryParseConfidence(e.Result);
                 _ = EmitTranscriptAsync(ssrc, participant, text, conf);
             };
@@ -196,11 +187,6 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 text,
                 dedupeKey,
                 ssrc).ConfigureAwait(false);
-            _logger.LogDebug(
-                "SPEECH[EMIT] Emitted final transcript for SSRC/sourceId {Ssrc}, participant={DisplayName}, chars={Length}.",
-                ssrc,
-                participant.DisplayName,
-                text.Length);
         }
         catch (Exception ex)
         {
