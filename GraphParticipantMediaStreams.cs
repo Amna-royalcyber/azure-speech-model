@@ -51,6 +51,8 @@ public sealed class SsrcParticipantMapper
     /// <summary>Alias: SSRC (sourceId) → Entra object id when bound.</summary>
     public string? GetParticipantId(uint ssrc) => GetParticipantIdBySsrc(ssrc);
 
+    public bool HasMapping(uint ssrc) => _streams.ContainsKey(ssrc);
+
     public Dictionary<uint, string> GetSsrcToParticipantMap()
     {
         lock (_listLock)

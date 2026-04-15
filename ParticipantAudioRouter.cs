@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
@@ -22,6 +23,7 @@ public sealed class ParticipantAudioRouter
     private string _botClientId = string.Empty;
     private readonly object _rescanLock = new();
     private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
+    private readonly ConcurrentDictionary<uint, DateTime> _unmappedSsrcLogThrottle = new();
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -92,13 +94,14 @@ public sealed class ParticipantAudioRouter
     {
         MaybeRescanParticipantMediaStreams();
 
-        if (_ssrcMapper.GetParticipantId(ssrc) is null)
+        if (!_ssrcMapper.HasMapping(ssrc))
         {
-            _meetingParticipants.TryLateBindSsrcWhenSingleHumanInRoster(ssrc, _participantManager);
-        }
-
-        if (_ssrcMapper.GetParticipantId(ssrc) is null)
-        {
+            if (!_unmappedSsrcLogThrottle.TryGetValue(ssrc, out var last) ||
+                (DateTime.UtcNow - last) >= TimeSpan.FromSeconds(10))
+            {
+                _unmappedSsrcLogThrottle[ssrc] = DateTime.UtcNow;
+                _logger.LogWarning("Dropping audio: SSRC/sourceId {Ssrc} is not mapped yet.", ssrc);
+            }
             return;
         }
 
