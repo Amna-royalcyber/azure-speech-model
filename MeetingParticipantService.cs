@@ -118,6 +118,41 @@ public sealed class MeetingParticipantService
         _ssrcMapper.Bind(sourceId, e);
     }
 
+    /// <summary>
+    /// When Graph has not yet published <c>mediaStreams</c> sourceIds but unmixed audio already carries an SSRC,
+    /// bind that stream to the only human in the roster. Safe only when exactly one remote user is present (e.g. solo test);
+    /// with 2+ humans, returns false (no guessing).
+    /// </summary>
+    public bool TryLateBindSsrcWhenSingleHumanInRoster(uint ssrc, ParticipantManager participantManager)
+    {
+        lock (_lock)
+        {
+            if (_rosterOrder.Count != 1)
+            {
+                return false;
+            }
+
+            if (_audioSourceIdToAzureObjectId.ContainsKey(ssrc))
+            {
+                return true;
+            }
+
+            var only = _rosterOrder[0];
+            var oid = only.AzureAdObjectId.Trim();
+            var intra = only.CallParticipantId.Trim();
+            var dn = string.IsNullOrWhiteSpace(only.DisplayName) ? oid : only.DisplayName.Trim();
+
+            BindMediaStreamToParticipant(ssrc, oid, intra);
+            participantManager.TryBindAudioSource(ssrc, oid, dn, "LateSingleParticipant");
+            _logger.LogWarning(
+                "Late SSRC bind: sourceId {Ssrc} -> sole roster participant {DisplayName} ({Oid}). Graph had not published mediaStreams yet.",
+                ssrc,
+                dn,
+                oid);
+            return true;
+        }
+    }
+
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
     {
         _audioSourceIdToAzureObjectId.Clear();

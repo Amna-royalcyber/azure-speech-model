@@ -94,6 +94,11 @@ public sealed class ParticipantAudioRouter
 
         if (_ssrcMapper.GetParticipantId(ssrc) is null)
         {
+            _meetingParticipants.TryLateBindSsrcWhenSingleHumanInRoster(ssrc, _participantManager);
+        }
+
+        if (_ssrcMapper.GetParticipantId(ssrc) is null)
+        {
             return;
         }
 

@@ -212,6 +212,11 @@ public static class Program
                 log.LogWarning(ex, "Invalid join request.");
                 return Results.BadRequest(new { message = ex.Message });
             }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already active", StringComparison.OrdinalIgnoreCase))
+            {
+                log.LogWarning(ex, "Join rejected: a call is already in progress.");
+                return Results.Conflict(new { message = ex.Message, transcriptKey });
+            }
             catch (Exception ex)
             {
                 log.LogError(ex, "Join meeting failed.");
@@ -261,6 +266,11 @@ public static class Program
             {
                 log.LogWarning(ex, "Invalid join request.");
                 return Results.BadRequest(new { message = ex.Message });
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("already active", StringComparison.OrdinalIgnoreCase))
+            {
+                log.LogWarning(ex, "Join rejected: a call is already in progress.");
+                return Results.Conflict(new { message = ex.Message });
             }
             catch (Exception ex)
             {

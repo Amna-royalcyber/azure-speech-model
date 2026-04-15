@@ -68,7 +68,7 @@ public sealed class MediaHandler
                 if (Interlocked.Increment(ref _loggedNoUnmixed) == 1)
                 {
                     _logger.LogWarning(
-                        "No unmixed buffers in AudioMediaReceived; need ReceiveUnmixedMeetingAudio and per-participant streams. Mixed audio cannot be attributed — dropped.");
+                        "No UnmixedAudioBuffers in this frame (common briefly at call start). If this repeats forever, Teams is not sending per-participant audio — check meeting type, tenant media policies, and that ReceiveUnmixedMeetingAudio is enabled. Mixed-only audio cannot be attributed.");
                 }
 
                 return;
