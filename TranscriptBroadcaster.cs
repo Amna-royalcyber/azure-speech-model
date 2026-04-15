@@ -36,6 +36,8 @@ public sealed class TranscriptBroadcaster
                     intraId,
                     participantId,
                     displayName,
+                    speakerLabel = displayName,
+                    sourceId = ssrc,
                     ssrc,
                     text,
                     confidence,

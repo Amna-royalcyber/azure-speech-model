@@ -99,17 +99,24 @@
       const line = document.createElement("div");
       line.className = "line final";
       let label = "";
+      const dn = pick(message, "displayName", "DisplayName");
       const sl = pick(message, "speakerLabel", "SpeakerLabel");
-      if (sl != null && String(sl).trim() !== "" && String(sl).trim() !== "0") {
+      if (dn != null && String(dn).trim() !== "") {
+        label = String(dn).trim();
+      } else if (sl != null && String(sl).trim() !== "" && String(sl).trim() !== "0") {
         label = String(sl).trim();
       }
       const aad = pick(message, "azureAdObjectId", "AzureAdObjectId");
       if (!label && aad && lastRosterByAad[aad]) {
         label = lastRosterByAad[aad];
       }
+      const sid = pick(message, "ssrc", "Ssrc") ?? pick(message, "sourceId", "SourceId");
+      if (sid != null && sid !== "") {
+        line.title = "Stream id (SSRC/sourceId): " + String(sid);
+      }
       const who = label
         ? `<span class="speaker">${escapeHtml(label)}</span>`
-        : "";
+        : `<span class="speaker">(unknown speaker)</span>`;
       const oid = aad
         ? ` <span class="aad-id" title="Microsoft Entra object ID">${escapeHtml(String(aad))}</span>`
         : "";
