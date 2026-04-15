@@ -8,18 +8,13 @@ using Microsoft.Extensions.Logging;
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Identity-first transcription: one Azure Speech continuous recognizer per Teams media stream id (<c>sourceId</c>).
-/// Recognizers start only after Graph has bound that stream to a participant (via <see cref="MeetingParticipantService"/>).
+/// One Azure Speech recognizer per media stream id. Identity is supplied by the caller (Graph + SSRC map); never inferred from audio.
 /// </summary>
 public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
 {
     private static readonly AudioStreamFormat Pcm16kMono = AudioStreamFormat.GetWaveFormatPCM(16000, 16, 1);
 
-    /// <summary>~15s PCM16 @ 16kHz mono while waiting for roster/mediaStreams binding.</summary>
-    private const int MaxPreIdentityBytes = 480_000;
-
     private readonly BotSettings _settings;
-    private readonly MeetingParticipantService _meetingParticipants;
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly IChunkManager _chunkManager;
     private readonly ILogger<AzureSpeechTranscriptionService> _logger;
@@ -34,89 +29,23 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
         public PushAudioInputStream? Push;
         public SpeechRecognizer? Recognizer;
         public bool Started;
-        public int PreIdentityBytes;
-        public readonly List<byte[]> PreBuffer = new();
-        public string IntraId = "";
-        public string ParticipantId = "";
-        public string DisplayName = "";
+        public TranscriptionParticipant? Participant;
     }
 
     public AzureSpeechTranscriptionService(
         BotSettings settings,
-        MeetingParticipantService meetingParticipants,
         TranscriptBroadcaster broadcaster,
         IChunkManager chunkManager,
         ILogger<AzureSpeechTranscriptionService> logger)
     {
         _settings = settings;
-        _meetingParticipants = meetingParticipants;
         _broadcaster = broadcaster;
         _chunkManager = chunkManager;
         _logger = logger;
     }
 
-    public void NotifyParticipantIdentityResolved(uint sourceId)
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _ = TryStartAfterIdentityAsync(sourceId);
-    }
-
-    private async Task TryStartAfterIdentityAsync(uint sourceId)
-    {
-        try
-        {
-            if (!_sessions.TryGetValue(sourceId, out var session))
-            {
-                return;
-            }
-
-            await session.Serialize.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                var shouldStart = false;
-                lock (session.Gate)
-                {
-                    if (session.Started)
-                    {
-                        return;
-                    }
-
-                    if (!_meetingParticipants.TryGetParticipantForMediaStream(
-                            sourceId,
-                            out var intraId,
-                            out var participantId,
-                            out var displayName))
-                    {
-                        return;
-                    }
-
-                    session.IntraId = intraId;
-                    session.ParticipantId = participantId;
-                    session.DisplayName = displayName;
-                    shouldStart = true;
-                }
-
-                if (shouldStart)
-                {
-                    await StartRecognizerAsync(session, sourceId).ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                session.Serialize.Release();
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Deferred recognizer start failed for stream {SourceId}.", sourceId);
-        }
-    }
-
-    public async Task ProcessPcm16Async(uint sourceId, byte[] pcm16kMono, long timestampHns)
+    /// <summary>Process PCM for a stream with identity already resolved. Unknown SSRC must be dropped by the caller.</summary>
+    public async Task ProcessAudioAsync(uint ssrc, TranscriptionParticipant participant, byte[] pcm16kMono, long timestampHns)
     {
         if (_disposed || pcm16kMono.Length == 0)
         {
@@ -135,49 +64,32 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
             return;
         }
 
-        var session = _sessions.GetOrAdd(sourceId, _ => new StreamSession());
+        var session = _sessions.GetOrAdd(ssrc, _ => new StreamSession());
         await session.Serialize.WaitAsync().ConfigureAwait(false);
         try
         {
-        var shouldStart = false;
-        lock (session.Gate)
-        {
-            if (!session.Started)
+            var shouldStart = false;
+            lock (session.Gate)
             {
-                if (!_meetingParticipants.TryGetParticipantForMediaStream(
-                        sourceId,
-                        out var intraId,
-                        out var participantId,
-                        out var displayName))
+                if (!session.Started)
                 {
-                    if (session.PreIdentityBytes + pcm16kMono.Length <= MaxPreIdentityBytes)
-                    {
-                        session.PreBuffer.Add(pcm16kMono);
-                        session.PreIdentityBytes += pcm16kMono.Length;
-                    }
-
-                    return;
+                    session.Participant = participant;
+                    shouldStart = true;
                 }
-
-                session.IntraId = intraId;
-                session.ParticipantId = participantId;
-                session.DisplayName = displayName;
-                shouldStart = true;
             }
-        }
 
-        if (shouldStart)
-        {
-            await StartRecognizerAsync(session, sourceId).ConfigureAwait(false);
-        }
-
-        lock (session.Gate)
-        {
-            if (session.Push is not null)
+            if (shouldStart)
             {
-                session.Push.Write(pcm16kMono);
+                await StartRecognizerAsync(session, ssrc, participant).ConfigureAwait(false);
             }
-        }
+
+            lock (session.Gate)
+            {
+                if (session.Push is not null)
+                {
+                    session.Push.Write(pcm16kMono);
+                }
+            }
         }
         finally
         {
@@ -185,7 +97,7 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
         }
     }
 
-    private async Task StartRecognizerAsync(StreamSession session, uint sourceId)
+    private async Task StartRecognizerAsync(StreamSession session, uint ssrc, TranscriptionParticipant participant)
     {
         lock (session.Gate)
         {
@@ -217,32 +129,15 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                     return;
                 }
 
-                string intraId;
-                string participantId;
-                string displayName;
-                if (!_meetingParticipants.TryGetParticipantForMediaStream(
-                        sourceId,
-                        out intraId!,
-                        out participantId!,
-                        out displayName!))
-                {
-                    lock (session.Gate)
-                    {
-                        intraId = session.IntraId;
-                        participantId = session.ParticipantId;
-                        displayName = session.DisplayName;
-                    }
-                }
-
                 var conf = TryParseConfidence(e.Result);
-                _ = EmitTranscriptAsync(sourceId, intraId, participantId, displayName, text, conf);
+                _ = EmitTranscriptAsync(ssrc, participant, text, conf);
             };
 
             recognizer.Canceled += (_, e) =>
             {
                 if (e.Reason == CancellationReason.Error)
                 {
-                    _logger.LogWarning("Azure Speech error on stream {SourceId}: {Details}", sourceId, e.ErrorDetails);
+                    _logger.LogWarning("Azure Speech error on stream {SourceId}: {Details}", ssrc, e.ErrorDetails);
                 }
             };
 
@@ -253,53 +148,41 @@ public sealed class AzureSpeechTranscriptionService : IAsyncDisposable
                 session.Push = push;
                 session.Recognizer = recognizer;
                 session.Started = true;
-                foreach (var chunk in session.PreBuffer)
-                {
-                    push.Write(chunk);
-                }
-
-                session.PreBuffer.Clear();
-                session.PreIdentityBytes = 0;
+                session.Participant = participant;
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Azure Speech recognizer failed for stream {SourceId}.", sourceId);
+            _logger.LogError(ex, "Azure Speech recognizer failed for stream {SourceId}.", ssrc);
         }
     }
 
-    private async Task EmitTranscriptAsync(
-        uint sourceId,
-        string intraId,
-        string participantId,
-        string displayName,
-        string text,
-        double? confidence)
+    private async Task EmitTranscriptAsync(uint ssrc, TranscriptionParticipant participant, string text, double? confidence)
     {
         try
         {
             var utc = DateTime.UtcNow;
             await _broadcaster.BroadcastStructuredTranscriptAsync(
-                intraId,
-                participantId,
-                displayName,
-                sourceId,
+                participant.IntraId,
+                participant.ParticipantId,
+                participant.DisplayName,
+                ssrc,
                 text,
                 confidence,
                 utc).ConfigureAwait(false);
 
-            var dedupeKey = $"{sourceId}|{utc.Ticks}|{text}";
+            var dedupeKey = $"{ssrc}|{utc.Ticks}|{text}";
             await _chunkManager.RecordFinalAsync(
                 utc,
-                participantId,
-                displayName,
+                participant.ParticipantId,
+                participant.DisplayName,
                 text,
                 dedupeKey,
-                sourceId).ConfigureAwait(false);
+                ssrc).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Emit transcript failed for stream {SourceId}.", sourceId);
+            _logger.LogError(ex, "Emit transcript failed for stream {SourceId}.", ssrc);
         }
     }
 

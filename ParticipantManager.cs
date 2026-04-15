@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace TeamsMediaBot;
@@ -63,7 +62,6 @@ public sealed class ParticipantManager : IParticipantManager
         participantId.StartsWith(SyntheticIdPrefix, StringComparison.OrdinalIgnoreCase);
 
     private readonly ILogger<ParticipantManager> _logger;
-    private readonly IServiceScopeFactory _scopeFactory;
     private readonly object _lifecycleLock = new();
 
     private readonly ConcurrentDictionary<string, ParticipantInfo> _participants =
@@ -79,10 +77,9 @@ public sealed class ParticipantManager : IParticipantManager
 
     private int _speakerCounter;
 
-    public ParticipantManager(ILogger<ParticipantManager> logger, IServiceScopeFactory scopeFactory)
+    public ParticipantManager(ILogger<ParticipantManager> logger)
     {
         _logger = logger;
-        _scopeFactory = scopeFactory;
     }
 
     public void BeginNewMeeting(string? callOrMeetingId)
@@ -338,7 +335,6 @@ public sealed class ParticipantManager : IParticipantManager
                         resolved);
                 }
 
-                ReflectIdentityStore(sourceId);
                 return null;
             }
 
@@ -395,21 +391,7 @@ public sealed class ParticipantManager : IParticipantManager
             binding.IsFinal,
             reason);
 
-        ReflectIdentityStore(sourceId);
         return null;
-    }
-
-    private void ReflectIdentityStore(uint sourceId)
-    {
-        if (!_bindings.TryGetValue(sourceId, out var b) || b is null)
-        {
-            return;
-        }
-
-        using var scope = _scopeFactory.CreateScope();
-        var store = scope.ServiceProvider.GetRequiredService<SpeakerIdentityStore>();
-        store.OnParticipantBindingUpdated(b);
-        scope.ServiceProvider.GetRequiredService<AzureSpeechTranscriptionService>().NotifyParticipantIdentityResolved(sourceId);
     }
 
     private string GetOrCreateSpeakerIdForUser(string userId)

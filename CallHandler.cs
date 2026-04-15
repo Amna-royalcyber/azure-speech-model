@@ -18,7 +18,6 @@ public sealed class CallHandler
     private readonly MeetingContextStore _meetingContext;
     private readonly ParticipantManager _participantManager;
     private readonly TranscriptionChunkManager _transcriptionChunkManager;
-    private readonly SpeakerIdentityStore _speakerIdentityStore;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
     private readonly object _activeCallLock = new();
@@ -31,7 +30,6 @@ public sealed class CallHandler
         MeetingContextStore meetingContext,
         ParticipantManager participantManager,
         TranscriptionChunkManager transcriptionChunkManager,
-        SpeakerIdentityStore speakerIdentityStore,
         ILogger<CallHandler> logger)
     {
         _settings = settings;
@@ -40,7 +38,6 @@ public sealed class CallHandler
         _meetingContext = meetingContext;
         _participantManager = participantManager;
         _transcriptionChunkManager = transcriptionChunkManager;
-        _speakerIdentityStore = speakerIdentityStore;
         _logger = logger;
     }
 
@@ -221,7 +218,6 @@ public sealed class CallHandler
         };
 
         _transcriptionChunkManager.ResetForNewJoin();
-        _speakerIdentityStore.ResetForNewMeeting();
         _participantManager.BeginNewMeeting(call.Id);
         _meetingParticipants.AttachToCall(call, _settings.ClientId);
         _participantAudioRouter.AttachToCall(call, _settings.ClientId);

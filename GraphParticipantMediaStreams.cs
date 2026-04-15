@@ -1,8 +1,88 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.Graph.Models;
 
 namespace TeamsMediaBot;
+
+/// <summary>One Teams media stream id (<see cref="Ssrc"/>) bound to an Entra <see cref="ParticipantId"/>.</summary>
+public sealed class MediaStreamInfo
+{
+    public uint Ssrc { get; set; }
+    public string ParticipantId { get; set; } = "";
+}
+
+/// <summary>
+/// Authoritative SSRC (sourceId) → Entra object id. Populated from Graph roster <c>mediaStreams</c>; audio without a bind is dropped.
+/// </summary>
+public sealed class SsrcParticipantMapper
+{
+    private readonly ConcurrentDictionary<uint, string> _streams = new();
+    private readonly object _listLock = new();
+    private readonly List<MediaStreamInfo> _orderedStreams = new();
+
+    public void Bind(uint ssrc, string participantId)
+    {
+        if (string.IsNullOrWhiteSpace(participantId))
+        {
+            return;
+        }
+
+        var pid = participantId.Trim();
+        _streams[ssrc] = pid;
+        lock (_listLock)
+        {
+            for (var i = 0; i < _orderedStreams.Count; i++)
+            {
+                if (_orderedStreams[i].Ssrc == ssrc)
+                {
+                    _orderedStreams[i] = new MediaStreamInfo { Ssrc = ssrc, ParticipantId = pid };
+                    return;
+                }
+            }
+
+            _orderedStreams.Add(new MediaStreamInfo { Ssrc = ssrc, ParticipantId = pid });
+        }
+    }
+
+    public string? GetParticipantIdBySsrc(uint ssrc) =>
+        _streams.TryGetValue(ssrc, out var p) ? p : null;
+
+    /// <summary>Alias: SSRC (sourceId) → Entra object id when bound.</summary>
+    public string? GetParticipantId(uint ssrc) => GetParticipantIdBySsrc(ssrc);
+
+    public Dictionary<uint, string> GetSsrcToParticipantMap()
+    {
+        lock (_listLock)
+        {
+            return _orderedStreams.ToDictionary(s => s.Ssrc, s => s.ParticipantId);
+        }
+    }
+
+    public void Clear()
+    {
+        _streams.Clear();
+        lock (_listLock)
+        {
+            _orderedStreams.Clear();
+        }
+    }
+
+    public void RemoveSsrc(uint ssrc)
+    {
+        _streams.TryRemove(ssrc, out _);
+        lock (_listLock)
+        {
+            for (var i = _orderedStreams.Count - 1; i >= 0; i--)
+            {
+                if (_orderedStreams[i].Ssrc == ssrc)
+                {
+                    _orderedStreams.RemoveAt(i);
+                }
+            }
+        }
+    }
+}
 
 /// <summary>Parses Teams/Graph <c>participant.resource.additionalData["mediaStreams"]</c> source ids (shared by router + roster).</summary>
 internal static class GraphParticipantMediaStreams

@@ -1,3 +1,4 @@
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Calls.Media;
@@ -11,6 +12,7 @@ public sealed class MediaHandler
     private readonly ILogger<MediaHandler> _logger;
     private readonly ParticipantAudioRouter _participantAudioRouter;
     private IAudioSocket? _audioSocket;
+    private int _loggedNoUnmixed;
 
     public MediaHandler(
         ILogger<MediaHandler> logger,
@@ -41,7 +43,7 @@ public sealed class MediaHandler
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
 
         _logger.LogInformation(
-            "Media session initialized with unmixed meeting audio; transcription uses per-stream Azure Speech after Graph stream→user mapping.");
+            "Media session initialized with unmixed audio. Each frame resolves SSRC (sourceId) at ingestion before routing.");
         return mediaSession;
     }
 
@@ -54,7 +56,39 @@ public sealed class MediaHandler
     {
         try
         {
-            await _participantAudioRouter.HandleAudioAsync(args);
+            var buffer = args.Buffer;
+            if (buffer is null)
+            {
+                return;
+            }
+
+            var unmixed = buffer.UnmixedAudioBuffers;
+            if (unmixed is null || !unmixed.Any())
+            {
+                if (Interlocked.Increment(ref _loggedNoUnmixed) == 1)
+                {
+                    _logger.LogWarning(
+                        "No unmixed buffers in AudioMediaReceived; need ReceiveUnmixedMeetingAudio and per-participant streams. Mixed audio cannot be attributed — dropped.");
+                }
+
+                return;
+            }
+
+            foreach (var ub in unmixed)
+            {
+                if (!UnmixedAudioHelpers.TryGetSsrc(ub, out var ssrc))
+                {
+                    continue;
+                }
+
+                var payload = UnmixedAudioHelpers.CopyPayload(ub.Data, ub.Length);
+                if (payload.Length == 0)
+                {
+                    continue;
+                }
+
+                await _participantAudioRouter.HandleAudioAsync(ssrc, payload, ub.OriginalSenderTimestamp);
+            }
         }
         catch (Exception ex)
         {

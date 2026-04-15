@@ -16,6 +16,7 @@ public sealed class MeetingParticipantService
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly EntraUserResolver _entra;
     private readonly IParticipantManager _participantManager;
+    private readonly SsrcParticipantMapper _ssrcMapper;
     private readonly ILogger<MeetingParticipantService> _logger;
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<string, DateTime> _noSourceLogThrottle = new(StringComparer.OrdinalIgnoreCase);
@@ -36,18 +37,92 @@ public sealed class MeetingParticipantService
         TranscriptBroadcaster broadcaster,
         EntraUserResolver entra,
         IParticipantManager participantManager,
+        SsrcParticipantMapper ssrcMapper,
         ILogger<MeetingParticipantService> logger)
     {
         _broadcaster = broadcaster;
         _entra = entra;
         _participantManager = participantManager;
+        _ssrcMapper = ssrcMapper;
         _logger = logger;
+    }
+
+    /// <summary>Register human participant as soon as Graph provides identity (does not wait for mediaStreams sourceId).</summary>
+    public void AddOrUpdateParticipant(string participantId, string displayName, string intraId)
+    {
+        if (string.IsNullOrWhiteSpace(participantId))
+        {
+            return;
+        }
+
+        var pid = participantId.Trim();
+        var dn = string.IsNullOrWhiteSpace(displayName) ? pid : displayName.Trim();
+        var intra = string.IsNullOrWhiteSpace(intraId) ? pid : intraId.Trim();
+
+        _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
+
+        lock (_lock)
+        {
+            var existingIdx = -1;
+            for (var i = 0; i < _rosterOrder.Count; i++)
+            {
+                if (string.Equals(_rosterOrder[i].AzureAdObjectId, pid, StringComparison.OrdinalIgnoreCase))
+                {
+                    existingIdx = i;
+                    break;
+                }
+            }
+
+            if (existingIdx >= 0)
+            {
+                var cur = _rosterOrder[existingIdx];
+                _rosterOrder[existingIdx] = cur with
+                {
+                    CallParticipantId = intra,
+                    DisplayName = dn
+                };
+            }
+            else
+            {
+                _rosterOrder.Add(new RosterEntry(intra, pid, dn, UserPrincipalName: null));
+            }
+
+            _callParticipantIdToAzureUserId[intra] = pid;
+        }
+    }
+
+    public bool TryGetTranscriptionParticipant(uint sourceId, out TranscriptionParticipant participant)
+    {
+        participant = default!;
+        if (!TryGetParticipantForMediaStream(sourceId, out var intraId, out var participantId, out var displayName))
+        {
+            return false;
+        }
+
+        participant = new TranscriptionParticipant(participantId, displayName, intraId);
+        return true;
+    }
+
+    /// <summary>Graph + router: bind Teams media stream id to Entra user and call participant id (intra).</summary>
+    public void BindMediaStreamToParticipant(uint sourceId, string entraObjectId, string intraCallParticipantId)
+    {
+        if (string.IsNullOrWhiteSpace(entraObjectId))
+        {
+            return;
+        }
+
+        var e = entraObjectId.Trim();
+        var intra = string.IsNullOrWhiteSpace(intraCallParticipantId) ? e : intraCallParticipantId.Trim();
+        _audioSourceIdToAzureObjectId[sourceId] = e;
+        _sourceIdToCallParticipantId[sourceId] = intra;
+        _ssrcMapper.Bind(sourceId, e);
     }
 
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
     {
         _audioSourceIdToAzureObjectId.Clear();
         _sourceIdToCallParticipantId.Clear();
+        _ssrcMapper.Clear();
         lock (_lock)
         {
             _callParticipantIdToAzureUserId.Clear();
@@ -209,50 +284,19 @@ public sealed class MeetingParticipantService
         var displayName = string.IsNullOrWhiteSpace(fromCall) ? null : fromCall;
 
         var needsGraph = string.IsNullOrWhiteSpace(displayName);
-        lock (_lock)
-        {
-            _callParticipantIdToAzureUserId[callPartId] = azureUserId;
 
-            var existingIdx = -1;
-            for (var i = 0; i < _rosterOrder.Count; i++)
-            {
-                if (string.Equals(_rosterOrder[i].AzureAdObjectId, azureUserId, StringComparison.OrdinalIgnoreCase))
-                {
-                    existingIdx = i;
-                    break;
-                }
-            }
-
-            if (existingIdx >= 0)
-            {
-                var cur = _rosterOrder[existingIdx];
-                if (!string.IsNullOrWhiteSpace(displayName))
-                {
-                    _rosterOrder[existingIdx] = cur with { DisplayName = displayName };
-                }
-            }
-            else
-            {
-                _rosterOrder.Add(new RosterEntry(
-                    callPartId,
-                    azureUserId,
-                    displayName ?? azureUserId,
-                    UserPrincipalName: null));
-            }
-        }
-
-        // Roster-first identity shell: participant identity exists before any audio/sourceId is seen.
-        _participantManager.RegisterParticipant(azureUserId, displayName ?? azureUserId, DateTime.UtcNow);
+        AddOrUpdateParticipant(azureUserId, displayName ?? azureUserId, callPartId);
 
         var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
         foreach (var sid in sourceIds)
         {
-            _audioSourceIdToAzureObjectId[sid] = azureUserId;
+            BindMediaStreamToParticipant(sid, azureUserId, callPartId);
             _logger.LogInformation(
-                "Authoritative stream map discovered: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}).",
+                "Authoritative stream map: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}); intra={IntraId}.",
                 sid,
                 displayName ?? azureUserId,
-                azureUserId);
+                azureUserId,
+                callPartId);
         }
 
         if (sourceIds.Count == 0)
@@ -269,18 +313,9 @@ public sealed class MeetingParticipantService
             }
             _noSourceLogThrottle[throttleKey] = DateTime.UtcNow;
 
-            var keys = resource.AdditionalData is null
-                ? "<none>"
-                : string.Join(", ", resource.AdditionalData.Keys);
-            var anonymized = ReadAdditionalDataBool(resource.AdditionalData, "isIdentityAnonymized");
-            var voiceConsent = ReadAdditionalDataString(resource.AdditionalData, "aiVoiceConsent");
-            _logger.LogInformation(
-                "Participant update has no sourceId yet for {DisplayName} ({AzureAdObjectId}). AdditionalData keys: {Keys}; isIdentityAnonymized={IsIdentityAnonymized}; aiVoiceConsent={AiVoiceConsent}",
-                displayName ?? azureUserId,
-                azureUserId,
-                keys,
-                anonymized.HasValue ? anonymized.Value.ToString() : "<missing>",
-                string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent);
+            _logger.LogWarning(
+                "Participant registered (Entra id {AzureAdObjectId}) but roster has no mediaStreams sourceId yet; unmixed audio for this user is dropped until Graph publishes stream ids.",
+                azureUserId);
         }
 
         _ = PublishRosterAsync();
@@ -357,6 +392,7 @@ public sealed class MeetingParticipantService
                 {
                     _audioSourceIdToAzureObjectId.TryRemove(kv.Key, out _);
                     _sourceIdToCallParticipantId.TryRemove(kv.Key, out _);
+                    _ssrcMapper.RemoveSsrc(kv.Key);
                 }
             }
         }

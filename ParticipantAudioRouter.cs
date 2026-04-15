@@ -1,6 +1,3 @@
-using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
@@ -10,14 +7,14 @@ using Microsoft.Skype.Bots.Media;
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Routes each unmixed Teams media stream (stable <c>sourceId</c>) to Azure Speech. Mixed-only meetings are not transcribed.
-/// Identity comes from Graph roster <c>mediaStreams</c> before transcription (see <see cref="MeetingParticipantService"/>).
+/// Routes each frame by SSRC (Teams <c>sourceId</c>) after Graph has bound that id to a participant. Unmapped SSRC → audio dropped.
 /// </summary>
 public sealed class ParticipantAudioRouter
 {
     private readonly AudioProcessor _audioProcessor;
     private readonly AzureSpeechTranscriptionService _azureSpeech;
     private readonly MeetingParticipantService _meetingParticipants;
+    private readonly SsrcParticipantMapper _ssrcMapper;
     private readonly ParticipantManager _participantManager;
     private readonly ILogger<ParticipantAudioRouter> _logger;
 
@@ -25,18 +22,19 @@ public sealed class ParticipantAudioRouter
     private string _botClientId = string.Empty;
     private readonly object _rescanLock = new();
     private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
-    private int _loggedNoUnmixed;
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
         AzureSpeechTranscriptionService azureSpeech,
         MeetingParticipantService meetingParticipants,
+        SsrcParticipantMapper ssrcMapper,
         ParticipantManager participantManager,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
         _azureSpeech = azureSpeech;
         _meetingParticipants = meetingParticipants;
+        _ssrcMapper = ssrcMapper;
         _participantManager = participantManager;
         _logger = logger;
     }
@@ -87,54 +85,37 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    public async Task HandleAudioAsync(AudioMediaReceivedEventArgs args)
+    /// <summary>
+    /// <paramref name="ssrc"/> is the Teams media stream id for this frame (same as Graph <c>mediaStreams[].sourceId</c>).
+    /// </summary>
+    public async Task HandleAudioAsync(uint ssrc, byte[] rawPayload, long timestampHns)
     {
         MaybeRescanParticipantMediaStreams();
 
-        var unmixed = args.Buffer.UnmixedAudioBuffers;
-        if (unmixed is null || !unmixed.Any())
+        if (_ssrcMapper.GetParticipantId(ssrc) is null)
         {
-            if (Interlocked.Increment(ref _loggedNoUnmixed) == 1)
-            {
-                _logger.LogInformation(
-                    "No unmixed audio buffers in this meeting; transcription requires unmixed participant audio (ReceiveUnmixedMeetingAudio). Mixed-only capture is not transcribed.");
-            }
-
             return;
         }
 
-        foreach (var ub in unmixed)
+        if (!_meetingParticipants.TryGetTranscriptionParticipant(ssrc, out var participant))
         {
-            var sourceId = ResolveUnmixedStreamSourceId(ub);
-            if (sourceId == (uint)DominantSpeakerChangedEventArgs.None)
-            {
-                continue;
-            }
-
-            var payload = CopyUnmixedBuffer(ub.Data, ub.Length);
-            if (payload.Length == 0)
-            {
-                continue;
-            }
-
-            var pcm = _audioProcessor.ConvertToPcm(new AudioFrame(
-                Data: payload,
-                Timestamp: ub.OriginalSenderTimestamp,
-                Length: (int)ub.Length,
-                Format: AudioFormat.Pcm16K));
-
-            if (pcm.Length == 0)
-            {
-                continue;
-            }
-
-            if (_meetingParticipants.TryGetParticipantForMediaStream(sourceId, out _, out _, out var dn))
-            {
-                _logger.LogDebug("PCM for stream {SourceId} ({Name}).", sourceId, dn);
-            }
-
-            await _azureSpeech.ProcessPcm16Async(sourceId, pcm, ub.OriginalSenderTimestamp);
+            return;
         }
+
+        var pcm = _audioProcessor.ConvertToPcm(new AudioFrame(
+            Data: rawPayload,
+            Timestamp: timestampHns,
+            Length: rawPayload.Length,
+            Format: AudioFormat.Pcm16K));
+
+        if (pcm.Length == 0)
+        {
+            return;
+        }
+
+        _logger.LogDebug("PCM for SSRC {Ssrc} ({Name}).", ssrc, participant.DisplayName);
+
+        await _azureSpeech.ProcessAudioAsync(ssrc, participant, pcm, timestampHns);
     }
 
     private void MaybeRescanParticipantMediaStreams()
@@ -170,37 +151,6 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    private static uint ResolveUnmixedStreamSourceId(UnmixedAudioBuffer ub)
-    {
-        var none = (uint)DominantSpeakerChangedEventArgs.None;
-        try
-        {
-            foreach (var propName in new[] { "SourceId", "StreamSourceId", "MediaSourceId" })
-            {
-                var p = ub.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
-                if (p is null)
-                {
-                    continue;
-                }
-
-                var val = p.GetValue(ub);
-                switch (val)
-                {
-                    case uint u when u != 0 && u != none:
-                        return u;
-                    case int i when i > 0:
-                        return (uint)i;
-                }
-            }
-        }
-        catch
-        {
-            // fall through
-        }
-
-        return Convert.ToUInt32(ub.ActiveSpeakerId);
-    }
-
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
     {
         var resource = participant.Resource;
@@ -228,26 +178,20 @@ public sealed class ParticipantAudioRouter
         var dn = displayName.Trim();
         _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
 
+        var callPartId = resource?.Id;
         foreach (var sourceId in GraphParticipantMediaStreams.ExtractSourceIds(resource))
         {
+            if (!string.IsNullOrWhiteSpace(callPartId))
+            {
+                _meetingParticipants.BindMediaStreamToParticipant(sourceId, pid, callPartId);
+            }
+
             _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
-            _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, dn, pid);
+            _logger.LogInformation("[SSRC BIND] sourceId {SourceId} -> {DisplayName} ({ParticipantId})", sourceId, dn, pid);
         }
     }
 
     private void RemoveParticipantMappings(IParticipant participant)
     {
-    }
-
-    private static byte[] CopyUnmixedBuffer(IntPtr ptr, long length)
-    {
-        if (ptr == IntPtr.Zero || length <= 0 || length > int.MaxValue)
-        {
-            return Array.Empty<byte>();
-        }
-
-        var bytes = new byte[(int)length];
-        Marshal.Copy(ptr, bytes, 0, (int)length);
-        return bytes;
     }
 }

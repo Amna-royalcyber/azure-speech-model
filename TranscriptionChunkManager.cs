@@ -46,7 +46,6 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
 
     private readonly BotSettings _settings;
     private readonly MeetingContextStore _meetingContext;
-    private readonly IParticipantManager _participantManager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<TranscriptionChunkManager> _logger;
 
@@ -60,13 +59,11 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
     public TranscriptionChunkManager(
         BotSettings settings,
         MeetingContextStore meetingContext,
-        IParticipantManager participantManager,
         IHttpClientFactory httpClientFactory,
         ILogger<TranscriptionChunkManager> logger)
     {
         _settings = settings;
         _meetingContext = meetingContext;
-        _participantManager = participantManager;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
     }
@@ -160,14 +157,10 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
                 return;
             }
 
-            var entraForAlb = sourceStreamId is uint sid
-                ? _participantManager.GetEntraOidForTranscript(sid)
-                : _participantManager.GetEntraObjectIdForTranscriptPayload(participantId);
-
             _currentWindow.Fragments.Add(new TranscriptItem
             {
                 Timestamp = utc,
-                EntraObjectId = entraForAlb,
+                EntraObjectId = participantId.Trim(),
                 ParticipantName = speakerName.Trim(),
                 Text = text.Trim(),
                 SourceStreamId = sourceStreamId
@@ -252,19 +245,9 @@ public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
                 continue;
             }
 
-            var resolvedName = fragment.ParticipantName;
-            if (fragment.SourceStreamId is uint sid)
-            {
-                var latestName = _participantManager.GetTranscriptSpeakerLabel(sid);
-                if (!string.IsNullOrWhiteSpace(latestName))
-                {
-                    resolvedName = latestName;
-                }
-            }
-
             transcriptList.Add(new AlbTranscriptLine
             {
-                Speaker = resolvedName,
+                Speaker = fragment.ParticipantName.Trim(),
                 Text = fragment.Text.Trim(),
                 Timestamp = fragment.Timestamp
             });
