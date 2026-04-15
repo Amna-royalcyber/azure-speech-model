@@ -50,6 +50,26 @@ public sealed class TranscriptBroadcaster
         }
     }
 
+    /// <summary>Optional UI hint when roster display name / Entra id updates for a stream. Does not change transcript identity (that is SSRC-bound before speech).</summary>
+    public async Task BroadcastTranscriptIdentityUpdateAsync(uint sourceId, string? displayName, string? entraOid)
+    {
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("transcript-update", new
+            {
+                type = "transcript-update",
+                sourceId,
+                displayName,
+                azureAdObjectId = entraOid,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR transcript-update failed for sourceId={SourceId}.", sourceId);
+        }
+    }
+
     public async Task BroadcastRosterAsync(IReadOnlyList<RosterParticipantDto> participants)
     {
         try
